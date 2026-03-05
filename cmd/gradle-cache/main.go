@@ -24,7 +24,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/alecthomas/errors"
@@ -110,9 +109,12 @@ func (c *RestoreCmd) Run(ctx context.Context) error {
 	}
 	slog.Info("cache hit", "key", hitKey)
 
-	// ── Download phase ────────────────────────────────────────────────────────
-	// Download to a temp file first so we get a clean download-speed measurement
-	// independent of decompression and file-extraction throughput.
+	// ── Download + extract phase (pipelined) ─────────────────────────────────
+	// The S3 body streams directly into pzstd → extractor with no temp file.
+	// Download and extraction run concurrently: pzstd decompresses as bytes
+	// arrive, and the extractor writes files as blocks are decompressed.
+	// This matches the Ruby aws-sdk-s3 behaviour and keeps total time close to
+	// max(download_time, extract_time) rather than their sum.
 	dlStart := time.Now()
 	slog.Info("downloading bundle", "key", hitKey)
 
@@ -121,36 +123,37 @@ func (c *RestoreCmd) Run(ctx context.Context) error {
 		return errors.Wrap(err, "create temp dir")
 	}
 
-	bundle, err := os.CreateTemp("", "gradle-cache-bundle-*")
+	body, _, err := client.get(ctx, c.Bucket, hitKey)
 	if err != nil {
-		return errors.Wrap(err, "create bundle temp file")
+		return errors.Wrap(err, "get bundle")
 	}
-	defer func() {
-		bundle.Close()           //nolint:errcheck,gosec
-		os.Remove(bundle.Name()) //nolint:errcheck,gosec
-	}()
+	defer body.Close() //nolint:errcheck,gosec
 
-	dlBytes, err := client.download(ctx, c.Bucket, hitKey, bundle)
-	if err != nil {
-		return errors.Wrap(err, "download bundle")
-	}
-	dlElapsed := time.Since(dlStart)
-	dlMBps := float64(dlBytes) / dlElapsed.Seconds() / 1e6
-	slog.Info("download complete", "duration", dlElapsed,
-		"size_mb", fmt.Sprintf("%.1f", float64(dlBytes)/1e6),
-		"speed_mbps", fmt.Sprintf("%.1f", dlMBps))
-
-	// ── Extract phase ─────────────────────────────────────────────────────────
-	if _, err := bundle.Seek(0, io.SeekStart); err != nil {
-		return errors.Wrap(err, "rewind bundle")
-	}
-	extractStart := time.Now()
-	if err := extractTarZstd(ctx, bundle, tmpDir); err != nil {
+	// countingBody records bytes consumed and timestamps when the S3 body is
+	// exhausted so we can log download speed independently of extraction.
+	cb := &countingBody{r: body, dlStart: dlStart}
+	if err := extractTarZstd(ctx, cb, tmpDir); err != nil {
 		return errors.Wrap(err, "extract bundle")
 	}
-	extractElapsed := time.Since(extractStart)
-	slog.Info("extract complete", "duration", extractElapsed,
-		"speed_mbps", fmt.Sprintf("%.1f", float64(dlBytes)/extractElapsed.Seconds()/1e6))
+
+	totalElapsed := time.Since(dlStart)
+
+	// Log download phase: time from start until the last S3 byte was consumed
+	// by the pzstd pipeline. Because download and extraction run concurrently,
+	// this is normally the dominant term.
+	if !cb.eofAt.IsZero() {
+		dlElapsed := cb.eofAt.Sub(dlStart)
+		slog.Info("download complete", "duration", dlElapsed.Round(time.Millisecond),
+			"size_mb", fmt.Sprintf("%.1f", float64(cb.n)/1e6),
+			"speed_mbps", fmt.Sprintf("%.1f", float64(cb.n)/dlElapsed.Seconds()/1e6))
+	}
+
+	// Log total restore time (find + download + extraction, all pipelined).
+	// The "extract tail" is the small gap between the last byte being consumed
+	// and the last file being written; most extraction happened during download.
+	slog.Info("restore pipeline complete",
+		"total_duration", totalElapsed.Round(time.Millisecond),
+		"extract_tail", time.Since(cb.eofAt).Round(time.Millisecond))
 
 	// Symlink $GRADLE_USER_HOME/caches → tmpDir/caches.
 	cachesTarget := filepath.Join(tmpDir, "caches")
@@ -452,6 +455,25 @@ func zstdDecompressCmd(ctx context.Context) *exec.Cmd {
 // pzstd/zstd decompresses in parallel; the resulting tar stream is extracted
 // by extractTarGo (pooled-buffer parallel writer) or piped to system tar as
 // a fallback when building without CGO on platforms where tar is unavailable.
+// countingBody wraps an io.Reader, counts bytes consumed, and records the time
+// at which the underlying reader returns io.EOF (i.e. when the last S3 byte
+// was consumed by the downstream pipeline).
+type countingBody struct {
+	r       io.Reader
+	n       int64
+	dlStart time.Time
+	eofAt   time.Time
+}
+
+func (c *countingBody) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	if err == io.EOF && c.eofAt.IsZero() {
+		c.eofAt = time.Now()
+	}
+	return n, err
+}
+
 func extractTarZstd(ctx context.Context, r io.Reader, dir string) error {
 	zstdCmd := zstdDecompressCmd(ctx)
 	zstdCmd.Stdin = r
@@ -479,17 +501,6 @@ func extractTarZstd(ctx context.Context, r io.Reader, dir string) error {
 		errs = append(errs, errors.Errorf("zstd: %w: %s", zstdErr, zstdStderr.String()))
 	}
 	return errors.Join(errs...)
-}
-
-// extractBufPool is a pool of reusable byte-slice pointers shared by all
-// platform extractors. Reusing slices eliminates per-file heap allocations and
-// the GC pressure they cause. Initial capacity is 256 KiB — large enough for
-// most Gradle cache files without needing a separate allocation.
-var extractBufPool = sync.Pool{
-	New: func() interface{} {
-		b := make([]byte, 0, 256<<10)
-		return &b
-	},
 }
 
 // zstdCompressCmd returns the command for zstd compression.

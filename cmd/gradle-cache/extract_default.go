@@ -12,14 +12,28 @@ import (
 	"github.com/alecthomas/errors"
 )
 
-// extractTarPlatform falls back to sequential extraction on unknown platforms.
+// extractTarPlatform falls back to sequential streaming extraction on unknown platforms.
 func extractTarPlatform(r io.Reader, dir string) error {
 	return extractTarSeq(r, dir)
 }
 
 func extractTarSeq(r io.Reader, dir string) error {
+	copyBuf := make([]byte, 1<<20)
 	tr := tar.NewReader(r)
 	cleanDir := filepath.Clean(dir) + string(os.PathSeparator)
+
+	createdDirs := make(map[string]struct{})
+	ensureDir := func(d string) error {
+		if _, ok := createdDirs[d]; ok {
+			return nil
+		}
+		if err := os.MkdirAll(d, 0o750); err != nil {
+			return err
+		}
+		createdDirs[d] = struct{}{}
+		return nil
+	}
+
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -28,37 +42,34 @@ func extractTarSeq(r io.Reader, dir string) error {
 		if err != nil {
 			return errors.Wrap(err, "read tar entry")
 		}
+
 		target := filepath.Join(dir, hdr.Name)
 		if !strings.HasPrefix(filepath.Clean(target)+string(os.PathSeparator), cleanDir) {
 			return errors.Errorf("tar entry %q escapes destination directory", hdr.Name)
 		}
+
 		switch hdr.Typeflag {
 		case tar.TypeDir:
-			if err := os.MkdirAll(target, hdr.FileInfo().Mode()); err != nil {
+			if err := ensureDir(target); err != nil {
 				return errors.Errorf("mkdir %s: %w", hdr.Name, err)
 			}
 		case tar.TypeReg:
-			bufPtr := extractBufPool.Get().(*[]byte)
-			if int64(cap(*bufPtr)) >= hdr.Size {
-				*bufPtr = (*bufPtr)[:hdr.Size]
-			} else {
-				*bufPtr = make([]byte, hdr.Size)
-			}
-			if _, err := io.ReadFull(tr, *bufPtr); err != nil {
-				extractBufPool.Put(bufPtr)
-				return errors.Errorf("read %s: %w", hdr.Name, err)
-			}
-			if err := os.MkdirAll(filepath.Dir(target), 0o750); err != nil {
-				extractBufPool.Put(bufPtr)
+			if err := ensureDir(filepath.Dir(target)); err != nil {
 				return errors.Errorf("mkdir %s: %w", hdr.Name, err)
 			}
-			if err := os.WriteFile(target, *bufPtr, hdr.FileInfo().Mode()); err != nil {
-				extractBufPool.Put(bufPtr)
+			f, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, hdr.FileInfo().Mode())
+			if err != nil {
+				return errors.Errorf("open %s: %w", hdr.Name, err)
+			}
+			if _, err := io.CopyBuffer(f, io.LimitReader(tr, hdr.Size), copyBuf); err != nil {
+				f.Close() //nolint:errcheck
 				return errors.Errorf("write %s: %w", hdr.Name, err)
 			}
-			extractBufPool.Put(bufPtr)
+			if err := f.Close(); err != nil {
+				return errors.Errorf("close %s: %w", hdr.Name, err)
+			}
 		case tar.TypeSymlink:
-			if err := os.MkdirAll(filepath.Dir(target), 0o750); err != nil {
+			if err := ensureDir(filepath.Dir(target)); err != nil {
 				return errors.Errorf("mkdir for symlink %s: %w", hdr.Name, err)
 			}
 			if err := os.Symlink(hdr.Linkname, target); err != nil {

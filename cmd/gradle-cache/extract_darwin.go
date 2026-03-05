@@ -13,6 +13,17 @@ import (
 	"github.com/alecthomas/errors"
 )
 
+// extractBufPool is a pool of reusable byte-slice pointers used by extractTarGo
+// on macOS. Reusing slices eliminates per-file heap allocations for the parallel
+// write path. Initial capacity is 256 KiB — large enough for most Gradle cache
+// files without needing a separate allocation.
+var extractBufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 0, 256<<10)
+		return &b
+	},
+}
+
 // mmapThreshold is the minimum file size above which ftruncate+mmap+memcpy is
 // faster than write() on macOS APFS. Below this threshold, mmap setup overhead
 // exceeds the savings. 64 KB covers most Gradle .jar files.
