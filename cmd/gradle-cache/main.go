@@ -122,12 +122,6 @@ func (c *RestoreCmd) Run(ctx context.Context) error {
 		return errors.Wrap(err, "create temp dir")
 	}
 
-	obj, contentLen, err := client.get(ctx, c.Bucket, hitKey)
-	if err != nil {
-		return errors.Wrap(err, "get object")
-	}
-	defer obj.Close() //nolint:errcheck
-
 	bundle, err := os.CreateTemp("", "gradle-cache-bundle-*")
 	if err != nil {
 		return errors.Wrap(err, "create bundle temp file")
@@ -137,18 +131,14 @@ func (c *RestoreCmd) Run(ctx context.Context) error {
 		os.Remove(bundle.Name()) //nolint:errcheck,gosec
 	}()
 
-	dlBytes, err := io.Copy(bundle, obj)
+	dlBytes, err := client.download(ctx, c.Bucket, hitKey, bundle)
 	if err != nil {
 		return errors.Wrap(err, "download bundle")
 	}
 	dlElapsed := time.Since(dlStart)
 	dlMBps := float64(dlBytes) / dlElapsed.Seconds() / 1e6
-	sizeMB := float64(dlBytes) / 1e6
-	if contentLen > 0 {
-		sizeMB = float64(contentLen) / 1e6
-	}
 	slog.Info("download complete", "duration", dlElapsed,
-		"size_mb", fmt.Sprintf("%.1f", sizeMB),
+		"size_mb", fmt.Sprintf("%.1f", float64(dlBytes)/1e6),
 		"speed_mbps", fmt.Sprintf("%.1f", dlMBps))
 
 	// ── Extract phase ─────────────────────────────────────────────────────────

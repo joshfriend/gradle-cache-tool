@@ -14,8 +14,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/alecthomas/errors"
@@ -66,24 +68,121 @@ func (c *s3Client) stat(ctx context.Context, bucket, key string) error {
 	return nil
 }
 
-// get downloads an object and returns its body as a ReadCloser plus the
-// Content-Length (-1 if unknown).
-func (c *s3Client) get(ctx context.Context, bucket, key string) (io.ReadCloser, int64, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.objectURL(bucket, key), nil)
+// download fetches an object from S3 into dst using parallel range requests,
+// matching the throughput of aws-sdk-s3's multipart download. It uses
+// max(8, runtime.NumCPU()) concurrent workers, each fetching a chunk with a
+// Range header and writing it to dst at the correct offset via WriteAt.
+// Returns the total number of bytes written.
+func (c *s3Client) download(ctx context.Context, bucket, key string, dst *os.File) (int64, error) {
+	// HEAD first to get the object size.
+	headReq, err := http.NewRequestWithContext(ctx, http.MethodHead, c.objectURL(bucket, key), nil)
 	if err != nil {
-		return nil, 0, err
+		return 0, err
 	}
-	c.sign(req)
-	resp, err := c.http.Do(req)
+	c.sign(headReq)
+	headResp, err := c.http.Do(headReq)
 	if err != nil {
-		return nil, 0, err
+		return 0, err
 	}
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		resp.Body.Close() //nolint:errcheck,gosec
-		return nil, 0, errors.Errorf("s3 GET %s/%s: status %d: %s", bucket, key, resp.StatusCode, body)
+	io.Copy(io.Discard, headResp.Body) //nolint:errcheck,gosec
+	headResp.Body.Close()              //nolint:errcheck,gosec
+	if headResp.StatusCode != http.StatusOK {
+		return 0, errors.Errorf("s3 HEAD %s/%s: status %d", bucket, key, headResp.StatusCode)
 	}
-	return resp.Body, resp.ContentLength, nil
+	size := headResp.ContentLength
+	if size <= 0 {
+		// Unknown size — fall back to single-stream download.
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.objectURL(bucket, key), nil)
+		if err != nil {
+			return 0, err
+		}
+		c.sign(req)
+		resp, err := c.http.Do(req) //nolint:gosec
+		if err != nil {
+			return 0, err
+		}
+		defer resp.Body.Close() //nolint:errcheck,gosec
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			return 0, errors.Errorf("s3 GET %s/%s: status %d: %s", bucket, key, resp.StatusCode, body)
+		}
+		return io.Copy(dst, resp.Body)
+	}
+
+	// Pre-allocate the file so each worker can WriteAt concurrently.
+	if err := dst.Truncate(size); err != nil {
+		return 0, errors.Wrap(err, "pre-allocate bundle file")
+	}
+
+	numWorkers := max(8, runtime.NumCPU())
+	chunkSize := (size + int64(numWorkers) - 1) / int64(numWorkers)
+
+	type result struct{ err error }
+	results := make([]result, numWorkers)
+	var wg sync.WaitGroup
+
+	for i := range numWorkers {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			start := int64(i) * chunkSize
+			end := min(start+chunkSize-1, size-1)
+
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.objectURL(bucket, key), nil)
+			if err != nil {
+				results[i].err = err
+				return
+			}
+			req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+			c.sign(req)
+
+			resp, err := c.http.Do(req) //nolint:gosec
+			if err != nil {
+				results[i].err = err
+				return
+			}
+			defer resp.Body.Close() //nolint:errcheck,gosec
+			if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
+				body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+				results[i].err = errors.Errorf("s3 GET range %d-%d: status %d: %s", start, end, resp.StatusCode, body)
+				return
+			}
+
+			// Write the chunk at the correct offset.
+			buf := make([]byte, 1<<20) // 1 MiB read buffer
+			offset := start
+			for {
+				n, readErr := resp.Body.Read(buf)
+				if n > 0 {
+					if _, writeErr := dst.WriteAt(buf[:n], offset); writeErr != nil {
+						results[i].err = errors.Wrap(writeErr, "write chunk")
+						return
+					}
+					offset += int64(n)
+				}
+				if readErr == io.EOF {
+					break
+				}
+				if readErr != nil {
+					results[i].err = errors.Wrap(readErr, "read chunk")
+					return
+				}
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	var errs []error
+	for _, r := range results {
+		if r.err != nil {
+			errs = append(errs, r.err)
+		}
+	}
+	if err := errors.Join(errs...); err != nil {
+		return 0, err
+	}
+	return size, nil
 }
 
 // put uploads r to S3 with a known content length.
