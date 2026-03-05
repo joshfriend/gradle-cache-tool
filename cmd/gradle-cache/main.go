@@ -93,10 +93,12 @@ func (c *RestoreCmd) Run(ctx context.Context) error {
 	}
 
 	var hitKey string
+	var hitSize int64
 	for _, sha := range commits {
 		key := s3Key(sha, c.CacheKey, bundleFile)
-		if err := client.stat(ctx, c.Bucket, key); err == nil {
+		if size, err := client.stat(ctx, c.Bucket, key); err == nil {
 			hitKey = key
+			hitSize = size
 			break
 		}
 		slog.Debug("cache miss", "sha", sha[:min(8, len(sha))])
@@ -123,7 +125,7 @@ func (c *RestoreCmd) Run(ctx context.Context) error {
 		return errors.Wrap(err, "create temp dir")
 	}
 
-	body, _, err := client.get(ctx, c.Bucket, hitKey)
+	body, err := client.get(ctx, c.Bucket, hitKey, hitSize)
 	if err != nil {
 		return errors.Wrap(err, "get bundle")
 	}
@@ -148,12 +150,10 @@ func (c *RestoreCmd) Run(ctx context.Context) error {
 			"speed_mbps", fmt.Sprintf("%.1f", float64(cb.n)/dlElapsed.Seconds()/1e6))
 	}
 
-	// Log total restore time (find + download + extraction, all pipelined).
-	// The "extract tail" is the small gap between the last byte being consumed
-	// and the last file being written; most extraction happened during download.
+	// Log total restore time. Download and extraction are pipelined so
+	// total ≈ download time + a small flush of buffered pipeline stages.
 	slog.Info("restore pipeline complete",
-		"total_duration", totalElapsed.Round(time.Millisecond),
-		"extract_tail", time.Since(cb.eofAt).Round(time.Millisecond))
+		"total_duration", totalElapsed.Round(time.Millisecond))
 
 	// Symlink $GRADLE_USER_HOME/caches → tmpDir/caches.
 	cachesTarget := filepath.Join(tmpDir, "caches")
@@ -269,7 +269,7 @@ func (c *SaveCmd) Run(ctx context.Context) error {
 	key := s3Key(c.Commit, c.CacheKey, bundleFile)
 
 	// Skip upload if bundle already exists.
-	if err := client.stat(ctx, c.Bucket, key); err == nil {
+	if _, err := client.stat(ctx, c.Bucket, key); err == nil {
 		slog.Info("bundle already exists", "key", key)
 		return nil
 	}

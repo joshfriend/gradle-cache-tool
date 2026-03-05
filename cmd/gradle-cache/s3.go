@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"net/http"
@@ -49,23 +50,24 @@ func newS3Client(region string) (*s3Client, error) {
 	}, nil
 }
 
-// stat returns nil if the object exists, or an error otherwise.
-func (c *s3Client) stat(ctx context.Context, bucket, key string) error {
+// stat returns the object size if the object exists, or an error otherwise.
+// The returned size is used by get() to plan chunk ranges without a second HEAD.
+func (c *s3Client) stat(ctx context.Context, bucket, key string) (int64, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, c.objectURL(bucket, key), nil)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	c.sign(req)
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	io.Copy(io.Discard, resp.Body) //nolint:errcheck,gosec
 	resp.Body.Close()              //nolint:errcheck,gosec
 	if resp.StatusCode != http.StatusOK {
-		return errors.Errorf("s3 HEAD %s/%s: status %d", bucket, key, resp.StatusCode)
+		return 0, errors.Errorf("s3 HEAD %s/%s: status %d", bucket, key, resp.StatusCode)
 	}
-	return nil
+	return resp.ContentLength, nil
 }
 
 const (
@@ -79,61 +81,45 @@ const (
 	downloadWorkers = 8
 )
 
-// get downloads an object and returns its body as a streaming ReadCloser plus
-// the Content-Length. For objects larger than one chunk it issues parallel
-// Range requests and reassembles them in order through an io.Pipe, so the
-// caller's pipeline (pzstd → extractor) runs concurrently with the download.
+// get downloads an object and returns its body as a streaming ReadCloser.
+// size must come from a prior stat() call — this avoids an extra HEAD round
+// trip. For objects larger than one chunk, parallel Range requests are issued
+// and reassembled in order through an io.Pipe so the caller's pipeline
+// (pzstd → extractor) runs concurrently with the download.
 // The caller must close the returned reader.
-func (c *s3Client) get(ctx context.Context, bucket, key string) (io.ReadCloser, int64, error) {
-	// HEAD first to get the object size for chunk planning.
-	headReq, err := http.NewRequestWithContext(ctx, http.MethodHead, c.objectURL(bucket, key), nil)
-	if err != nil {
-		return nil, 0, err
-	}
-	c.sign(headReq)
-	headResp, err := c.http.Do(headReq)
-	if err != nil {
-		return nil, 0, err
-	}
-	io.Copy(io.Discard, headResp.Body) //nolint:errcheck,gosec
-	headResp.Body.Close()              //nolint:errcheck,gosec
-	if headResp.StatusCode != http.StatusOK {
-		return nil, 0, errors.Errorf("s3 HEAD %s/%s: status %d", bucket, key, headResp.StatusCode)
-	}
-	size := headResp.ContentLength
-
-	// Small object or unknown size: single-stream GET is simpler.
+func (c *s3Client) get(ctx context.Context, bucket, key string, size int64) (io.ReadCloser, error) {
+	// Small object or unknown size: single-stream GET.
 	if size <= downloadChunkSize {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.objectURL(bucket, key), nil)
 		if err != nil {
-			return nil, 0, err
+			return nil, err
 		}
 		c.sign(req)
-		resp, err := c.http.Do(req)
+		resp, err := c.http.Do(req) //nolint:gosec
 		if err != nil {
-			return nil, 0, err
+			return nil, err
 		}
 		if resp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 			resp.Body.Close() //nolint:errcheck,gosec
-			return nil, 0, errors.Errorf("s3 GET %s/%s: status %d: %s", bucket, key, resp.StatusCode, body)
+			return nil, errors.Errorf("s3 GET %s/%s: status %d: %s", bucket, key, resp.StatusCode, body)
 		}
-		return resp.Body, resp.ContentLength, nil
+		return resp.Body, nil
 	}
 
-	// Large object: parallel range requests, chunks reassembled in order and
-	// piped to the caller so download and extraction run concurrently.
+	// Large object: parallel range requests, reassembled in order and piped to
+	// the caller so download and extraction run concurrently.
 	pr, pw := io.Pipe()
 	go func() {
 		pw.CloseWithError(c.parallelGet(ctx, bucket, key, size, pw))
 	}()
-	return pr, size, nil
+	return pr, nil
 }
 
 // parallelGet downloads the object in parallel chunks and writes them in order
-// to w. numWorkers goroutines pull from a shared work queue, each fetching one
-// chunk and sending it to a per-chunk result channel. The writer goroutine
-// reads result channels in sequence to preserve order.
+// to w. Each worker drains its chunk fully into memory so its TCP connection
+// stays active at full speed. All workers run concurrently, saturating the
+// available S3 bandwidth. Peak memory is numWorkers × downloadChunkSize.
 func (c *s3Client) parallelGet(ctx context.Context, bucket, key string, size int64, w io.Writer) error {
 	numChunks := int((size + downloadChunkSize - 1) / downloadChunkSize)
 	numWorkers := max(downloadWorkers, runtime.NumCPU())
@@ -144,13 +130,13 @@ func (c *s3Client) parallelGet(ctx context.Context, bucket, key string, size int
 	}
 
 	// Pre-allocate a buffered result channel per chunk (capacity 1 so the
-	// worker goroutine never blocks after writing its result).
+	// worker never blocks after draining its body).
 	results := make([]chan chunkResult, numChunks)
 	for i := range results {
 		results[i] = make(chan chunkResult, 1)
 	}
 
-	// Work queue: chunk indices in order.
+	// Work queue: chunk indices.
 	work := make(chan int, numChunks)
 	for i := range numChunks {
 		work <- i
@@ -180,11 +166,14 @@ func (c *s3Client) parallelGet(ctx context.Context, bucket, key string, size int
 					continue
 				}
 				if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
-					body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+					msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 					resp.Body.Close() //nolint:errcheck,gosec
-					results[seq] <- chunkResult{err: errors.Errorf("s3 GET range %d-%d: status %d: %s", start, end, resp.StatusCode, body)}
+					results[seq] <- chunkResult{err: errors.Errorf("s3 GET range %d-%d: status %d: %s", start, end, resp.StatusCode, msg)}
 					continue
 				}
+				// Drain the body immediately so the TCP connection stays at
+				// full speed. All workers do this concurrently, saturating
+				// the available bandwidth across all parallel connections.
 				data, readErr := io.ReadAll(resp.Body)
 				resp.Body.Close() //nolint:errcheck,gosec
 				results[seq] <- chunkResult{data: data, err: readErr}
@@ -193,7 +182,7 @@ func (c *s3Client) parallelGet(ctx context.Context, bucket, key string, size int
 	}
 
 	// Write chunks to w in order. Each receive blocks until that chunk's
-	// worker has finished, while other workers continue downloading ahead.
+	// worker has drained its body, while other workers continue concurrently.
 	var writeErr error
 	for _, ch := range results {
 		r := <-ch
@@ -213,8 +202,27 @@ func (c *s3Client) parallelGet(ctx context.Context, bucket, key string, size int
 	return writeErr
 }
 
-// put uploads r to S3 with a known content length.
-func (c *s3Client) put(ctx context.Context, bucket, key string, r io.Reader, size int64, contentType string) error {
+const (
+	// uploadPartSize is the size of each multipart upload part.
+	// 64 MiB = at most 160 parts for a 10 GB object, well within the S3
+	// 10 000 part limit. Minimum S3 part size is 5 MiB (except last part).
+	uploadPartSize = 64 << 20
+	// uploadWorkers is the number of concurrent part uploads.
+	uploadWorkers = 8
+)
+
+// put uploads a seekable file to S3. For objects larger than one part it uses
+// parallel multipart upload; smaller objects use a single-part PUT.
+// r must implement io.ReadSeeker (e.g. *os.File).
+func (c *s3Client) put(ctx context.Context, bucket, key string, r io.ReadSeeker, size int64, contentType string) error {
+	if size <= uploadPartSize {
+		return c.putSingle(ctx, bucket, key, r, size, contentType)
+	}
+	return c.putMultipart(ctx, bucket, key, r, size, contentType)
+}
+
+// putSingle uploads r as a single PUT request.
+func (c *s3Client) putSingle(ctx context.Context, bucket, key string, r io.Reader, size int64, contentType string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.objectURL(bucket, key), r)
 	if err != nil {
 		return err
@@ -224,7 +232,7 @@ func (c *s3Client) put(ctx context.Context, bucket, key string, r io.Reader, siz
 		req.Header.Set("Content-Type", contentType)
 	}
 	c.sign(req)
-	resp, err := c.http.Do(req)
+	resp, err := c.http.Do(req) //nolint:gosec
 	if err != nil {
 		return err
 	}
@@ -233,6 +241,176 @@ func (c *s3Client) put(ctx context.Context, bucket, key string, r io.Reader, siz
 	if resp.StatusCode != http.StatusOK {
 		return errors.Errorf("s3 PUT %s/%s: status %d: %s", bucket, key, resp.StatusCode, body)
 	}
+	return nil
+}
+
+// putMultipart uploads a large file using parallel S3 multipart upload.
+// Parts are uploaded concurrently; the final CompleteMultipartUpload is issued
+// only after all parts succeed. The upload is aborted on any error.
+func (c *s3Client) putMultipart(ctx context.Context, bucket, key string, r io.ReadSeeker, size int64, contentType string) error {
+	uploadID, err := c.createMultipartUpload(ctx, bucket, key, contentType)
+	if err != nil {
+		return err
+	}
+
+	numParts := int((size + uploadPartSize - 1) / uploadPartSize)
+
+	type partResult struct {
+		num  int
+		etag string
+		err  error
+	}
+
+	results := make(chan partResult, numParts)
+	work := make(chan int, numParts)
+	for i := range numParts {
+		work <- i
+	}
+	close(work)
+
+	var wg sync.WaitGroup
+	for range min(uploadWorkers, numParts) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for seq := range work {
+				partNum := seq + 1 // S3 part numbers are 1-based
+				offset := int64(seq) * uploadPartSize
+				partSize := min(uploadPartSize, size-offset)
+
+				// Read the part slice from the file at the correct offset.
+				// Each goroutine reads a non-overlapping region; io.NewSectionReader
+				// is safe for concurrent use on the same *os.File.
+				sr := io.NewSectionReader(r.(io.ReaderAt), offset, partSize)
+				etag, err := c.uploadPart(ctx, bucket, key, uploadID, partNum, sr, partSize)
+				results <- partResult{num: partNum, etag: etag, err: err}
+			}
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	type completedPart struct {
+		XMLName    xml.Name `xml:"Part"`
+		PartNumber int      `xml:"PartNumber"`
+		ETag       string   `xml:"ETag"`
+	}
+	parts := make([]completedPart, numParts)
+	var firstErr error
+	for r := range results {
+		if r.err != nil && firstErr == nil {
+			firstErr = r.err
+		}
+		if r.err == nil {
+			parts[r.num-1] = completedPart{PartNumber: r.num, ETag: r.etag}
+		}
+	}
+
+	if firstErr != nil {
+		c.abortMultipartUpload(ctx, bucket, key, uploadID) //nolint:errcheck
+		return firstErr
+	}
+
+	return c.completeMultipartUpload(ctx, bucket, key, uploadID, parts)
+}
+
+// createMultipartUpload initiates an S3 multipart upload and returns the UploadId.
+func (c *s3Client) createMultipartUpload(ctx context.Context, bucket, key, contentType string) (string, error) {
+	u := c.objectURL(bucket, key) + "?uploads"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, nil)
+	if err != nil {
+		return "", err
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	c.sign(req)
+	resp, err := c.http.Do(req) //nolint:gosec
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close() //nolint:errcheck,gosec
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return "", errors.Errorf("s3 CreateMultipartUpload %s/%s: status %d: %s", bucket, key, resp.StatusCode, body)
+	}
+	var result struct {
+		UploadID string `xml:"UploadId"`
+	}
+	if err := xml.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", errors.Wrap(err, "decode CreateMultipartUpload response")
+	}
+	return result.UploadID, nil
+}
+
+// uploadPart uploads one part and returns the ETag from the response.
+func (c *s3Client) uploadPart(ctx context.Context, bucket, key, uploadID string, partNum int, r io.Reader, size int64) (string, error) {
+	u := fmt.Sprintf("%s?partNumber=%d&uploadId=%s", c.objectURL(bucket, key), partNum, url.QueryEscape(uploadID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u, r)
+	if err != nil {
+		return "", err
+	}
+	req.ContentLength = size
+	c.sign(req)
+	resp, err := c.http.Do(req) //nolint:gosec
+	if err != nil {
+		return "", err
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	resp.Body.Close() //nolint:errcheck,gosec
+	if resp.StatusCode != http.StatusOK {
+		return "", errors.Errorf("s3 UploadPart %s/%s part %d: status %d: %s", bucket, key, partNum, resp.StatusCode, body)
+	}
+	return resp.Header.Get("ETag"), nil
+}
+
+// completeMultipartUpload finalises the upload by listing all completed parts.
+func (c *s3Client) completeMultipartUpload(ctx context.Context, bucket, key, uploadID string, parts any) error {
+	type completeReq struct {
+		XMLName xml.Name `xml:"CompleteMultipartUpload"`
+		Parts   any      `xml:"Part"`
+	}
+	xmlBody, err := xml.Marshal(completeReq{Parts: parts})
+	if err != nil {
+		return err
+	}
+	u := fmt.Sprintf("%s?uploadId=%s", c.objectURL(bucket, key), url.QueryEscape(uploadID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, strings.NewReader(string(xmlBody)))
+	if err != nil {
+		return err
+	}
+	req.ContentLength = int64(len(xmlBody))
+	req.Header.Set("Content-Type", "application/xml")
+	c.sign(req)
+	resp, err := c.http.Do(req) //nolint:gosec
+	if err != nil {
+		return err
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	resp.Body.Close() //nolint:errcheck,gosec
+	if resp.StatusCode != http.StatusOK {
+		return errors.Errorf("s3 CompleteMultipartUpload %s/%s: status %d: %s", bucket, key, resp.StatusCode, body)
+	}
+	return nil
+}
+
+// abortMultipartUpload cancels an in-progress multipart upload.
+func (c *s3Client) abortMultipartUpload(ctx context.Context, bucket, key, uploadID string) error {
+	u := fmt.Sprintf("%s?uploadId=%s", c.objectURL(bucket, key), url.QueryEscape(uploadID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, u, nil)
+	if err != nil {
+		return err
+	}
+	c.sign(req)
+	resp, err := c.http.Do(req) //nolint:gosec
+	if err != nil {
+		return err
+	}
+	io.Copy(io.Discard, resp.Body) //nolint:errcheck,gosec
+	resp.Body.Close()              //nolint:errcheck,gosec
 	return nil
 }
 
