@@ -719,11 +719,81 @@ func TestTarZstdSymlinkDereference(t *testing.T) {
 	}
 }
 
+// ─── extractTar parallelism benchmarks ──────────────────────────────────────
+
+// BenchmarkExtractTarParallelism sweeps over worker counts and two realistic
+// Gradle cache profiles (many small files, fewer larger files) so you can see
+// where the parallel write pool stops helping on the current machine.
+//
+// Run with:
+//
+//	go test -run='^$' -bench=BenchmarkExtractTarParallelism -benchtime=3s -count=3
+func BenchmarkExtractTarParallelism(b *testing.B) {
+	profiles := []struct {
+		name      string
+		fileCount int
+		fileSize  int
+	}{
+		{"100x1KB", 100, 1 << 10},
+		{"1000x1KB", 1000, 1 << 10},
+		{"100x64KB", 100, 64 << 10},
+		{"1000x64KB", 1000, 64 << 10},
+	}
+
+	workerCounts := []int{1, 2, 4, 8, 16, 32, 64}
+
+	for _, p := range profiles {
+		// Build the tar archive once; reuse it for every sub-benchmark.
+		tarData := makeBenchTar(b, p.fileCount, p.fileSize)
+
+		for _, n := range workerCounts {
+			b.Run(fmt.Sprintf("%s/workers=%d", p.name, n), func(b *testing.B) {
+				b.SetBytes(int64(p.fileCount * p.fileSize))
+				b.ResetTimer()
+				for range b.N {
+					dir := b.TempDir()
+					if err := extractTarN(bytes.NewReader(tarData), dir, n); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+	}
+}
+
+// makeBenchTar builds an in-memory tar archive with count files of the given size.
+func makeBenchTar(b *testing.B, count, size int) []byte {
+	b.Helper()
+	payload := bytes.Repeat([]byte("x"), size)
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	for i := range count {
+		name := fmt.Sprintf("file%04d.bin", i)
+		must2(b, tw.WriteHeader(&tar.Header{
+			Typeflag: tar.TypeReg,
+			Name:     name,
+			Mode:     0o644,
+			Size:     int64(size),
+		}))
+		_, err := tw.Write(payload)
+		must2(b, err)
+	}
+	must2(b, tw.Close())
+	return buf.Bytes()
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 func must(t *testing.T, err error) {
 	t.Helper()
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func must2(b *testing.B, err error) {
+	b.Helper()
+	if err != nil {
+		b.Fatal(err)
 	}
 }

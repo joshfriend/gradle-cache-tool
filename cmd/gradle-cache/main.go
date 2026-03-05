@@ -447,16 +447,18 @@ func extractTarZstd(ctx context.Context, r io.Reader, dir string) error {
 // writes are dispatched to a worker pool (one worker per logical CPU) so that
 // many small files can be flushed to disk concurrently.
 func extractTar(r io.Reader, dir string) error {
+	// File writes are I/O bound. Benchmarks show the sweet spot is ~1×CPU;
+	// 16 is a floor for machines with few cores where 1×CPU underutilizes IOPS.
+	return extractTarN(r, dir, max(16, runtime.NumCPU()))
+}
+
+func extractTarN(r io.Reader, dir string, numWorkers int) error {
 	type fileJob struct {
 		path string
 		mode os.FileMode
 		data []byte
 	}
 
-	// File writes are I/O bound, so we use more workers than CPU cores to keep
-	// the NVMe queue full. 2×CPU gives a reasonable baseline; 16 is a floor for
-	// machines with few cores where 2×CPU would still underutilize IOPS.
-	numWorkers := max(16, 2*runtime.NumCPU())
 	jobs := make(chan fileJob, numWorkers*2)
 
 	var (
