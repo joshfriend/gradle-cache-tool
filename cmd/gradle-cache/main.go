@@ -23,6 +23,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -119,16 +120,28 @@ func (c *RestoreCmd) Run(ctx context.Context) error {
 		return errors.Wrap(err, "create temp dir")
 	}
 
-	obj, err := client.get(ctx, c.Bucket, hitKey)
+	obj, contentLen, err := client.get(ctx, c.Bucket, hitKey)
 	if err != nil {
 		return errors.Wrap(err, "get object")
 	}
 	defer obj.Close() //nolint:errcheck
 
-	if err := extractTarZstd(ctx, obj, tmpDir); err != nil {
+	// Wrap with a counting reader so we can log download speed.
+	cr := &countingReader{r: obj}
+	if err := extractTarZstd(ctx, cr, tmpDir); err != nil {
 		return errors.Wrap(err, "extract bundle")
 	}
-	slog.Debug("download+extract complete", "duration", time.Since(dlStart))
+	elapsed := time.Since(dlStart)
+	mbps := float64(cr.n) / elapsed.Seconds() / 1e6
+	if contentLen > 0 {
+		slog.Info("download+extract complete", "duration", elapsed,
+			"size_mb", fmt.Sprintf("%.1f", float64(contentLen)/1e6),
+			"speed_mbps", fmt.Sprintf("%.1f", mbps))
+	} else {
+		slog.Info("download+extract complete", "duration", elapsed,
+			"size_mb", fmt.Sprintf("%.1f", float64(cr.n)/1e6),
+			"speed_mbps", fmt.Sprintf("%.1f", mbps))
+	}
 
 	// Symlink $GRADLE_USER_HOME/caches → tmpDir/caches.
 	cachesTarget := filepath.Join(tmpDir, "caches")
@@ -288,7 +301,11 @@ func (c *SaveCmd) Run(ctx context.Context) error {
 		return errors.Wrap(err, "upload bundle")
 	}
 
-	slog.Debug("archive+upload complete", "duration", time.Since(saveStart))
+	elapsed := time.Since(saveStart)
+	mbps := float64(size) / elapsed.Seconds() / 1e6
+	slog.Info("archive+upload complete", "duration", elapsed,
+		"size_mb", fmt.Sprintf("%.1f", float64(size)/1e6),
+		"speed_mbps", fmt.Sprintf("%.1f", mbps))
 	slog.Info("saved bundle", "key", key)
 	return nil
 }
@@ -410,11 +427,36 @@ func gitHead(ctx context.Context, gitDir string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+// countingReader wraps an io.Reader and counts bytes read.
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
+}
+
+// zstdDecompressArgs returns the command + args for zstd decompression.
+// Prefers pzstd (parallel, same format as pzstd-compressed bundles) and
+// falls back to zstd -dc -TN.
+func zstdDecompressCmd(ctx context.Context) *exec.Cmd {
+	n := strconv.Itoa(max(1, runtime.NumCPU()))
+	if path, err := exec.LookPath("pzstd"); err == nil {
+		// -d decompress, -p N = N threads, -c write to stdout
+		return exec.CommandContext(ctx, path, "-d", "-p", n, "-c") //nolint:gosec
+	}
+	return exec.CommandContext(ctx, "zstd", "-dc", "-T"+n) //nolint:gosec
+}
+
 // extractTarZstd decompresses a zstd-compressed tar stream from r into dir.
-// Decompression runs in the zstd subprocess (-T0 uses all cores); file writes
-// are dispatched to a worker pool so NVMe IOPS can be fully exploited.
+// Uses pzstd when available for parallel frame decompression (matching the
+// parallel compression used on the save path); falls back to zstd -dc -T0.
+// File writes are dispatched to a worker pool so NVMe IOPS can be exploited.
 func extractTarZstd(ctx context.Context, r io.Reader, dir string) error {
-	zstdCmd := exec.CommandContext(ctx, "zstd", "-dc", "-T0")
+	zstdCmd := zstdDecompressCmd(ctx)
 	zstdCmd.Stdin = r
 
 	zstdOut, err := zstdCmd.StdoutPipe()
@@ -543,6 +585,18 @@ readLoop:
 	return errors.Join(allErrs...)
 }
 
+// zstdCompressCmd returns the command for zstd compression.
+// Prefers pzstd (creates parallel frames, decompressable in parallel) and
+// falls back to zstd -TN -c.
+func zstdCompressCmd(ctx context.Context) *exec.Cmd {
+	n := strconv.Itoa(max(1, runtime.NumCPU()))
+	if path, err := exec.LookPath("pzstd"); err == nil {
+		// -p N = N threads, -c write to stdout
+		return exec.CommandContext(ctx, path, "-p", n, "-c") //nolint:gosec
+	}
+	return exec.CommandContext(ctx, "zstd", "-T"+n, "-c") //nolint:gosec
+}
+
 // createTarZstd creates a zstd-compressed tar archive from the given sources and
 // writes it to w. Uses -h to dereference symlinks, matching bundled-cache-manager.rb.
 // Multiple sources map to multiple -C baseDir path entries in the tar command,
@@ -554,7 +608,7 @@ func createTarZstd(ctx context.Context, w io.Writer, sources []tarSource) error 
 		args = append(args, "-C", src.BaseDir, src.Path)
 	}
 	tarCmd := exec.CommandContext(ctx, "tar", args...) //nolint:gosec
-	zstdCmd := exec.CommandContext(ctx, "zstd", "-T0", "-c")
+	zstdCmd := zstdCompressCmd(ctx)
 
 	tarStdout, err := tarCmd.StdoutPipe()
 	if err != nil {

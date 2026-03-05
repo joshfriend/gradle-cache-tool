@@ -66,23 +66,24 @@ func (c *s3Client) stat(ctx context.Context, bucket, key string) error {
 	return nil
 }
 
-// get downloads an object and returns its body as a ReadCloser.
-func (c *s3Client) get(ctx context.Context, bucket, key string) (io.ReadCloser, error) {
+// get downloads an object and returns its body as a ReadCloser plus the
+// Content-Length (-1 if unknown).
+func (c *s3Client) get(ctx context.Context, bucket, key string) (io.ReadCloser, int64, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.objectURL(bucket, key), nil)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	c.sign(req)
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		resp.Body.Close() //nolint:errcheck,gosec
-		return nil, errors.Errorf("s3 GET %s/%s: status %d: %s", bucket, key, resp.StatusCode, body)
+		return nil, 0, errors.Errorf("s3 GET %s/%s: status %d: %s", bucket, key, resp.StatusCode, body)
 	}
-	return resp.Body, nil
+	return resp.Body, resp.ContentLength, nil
 }
 
 // put uploads r to S3 with a known content length.
