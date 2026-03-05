@@ -19,7 +19,7 @@ jobs:
         run: sudo apt-get install -y zstd
 
       - name: Test
-        run: go test ./...
+        run: go test -run ^Test ./...
 
       - name: Build
         run: go build ./...
@@ -43,17 +43,13 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Activate Hermit
         run: echo "${GITHUB_WORKSPACE}/bin" >> "$GITHUB_PATH"
 
-      - name: Build all platforms and fat binary
-        run: just build-fat
-
-      - name: Build macOS universal binary
-        run: just build-universal
-
-      - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/gradle-cache*
+      - name: Release
+        run: goreleaser release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

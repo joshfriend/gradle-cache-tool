@@ -1,0 +1,35 @@
+version: 2
+
+builds:
+  - id: gradle-cache
+    main: ./cmd/gradle-cache
+    binary: gradle-cache
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+
+universal_binaries:
+  - ids: [gradle-cache]
+    replace: true
+    name_template: gradle-cache
+
+archives:
+  - formats: [binary]
+    name_template: >-
+      gradle-cache-{{ .Os }}-
+      {{- if eq .Arch "all" }}universal{{ else }}{{ .Arch }}{{ end }}
+
+checksum:
+  name_template: checksums.txt
+
+release:
+  draft: false

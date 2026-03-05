@@ -13,6 +13,14 @@ The history walk counts distinct author-change boundaries rather than raw
 commit count, so a long run of commits by the same author only consumes one
 step of the search budget. The default search depth is 20 such boundaries.
 
+## Installation
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/joshfriend/gradle-cache-tool/main/scripts/install.sh | sh
+```
+
+This installs the latest release to `~/.local/bin`. Set `INSTALL_DIR` to override the destination, or `VERSION` to pin a specific release tag.
+
 ## Usage
 
 ```
