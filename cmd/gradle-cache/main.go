@@ -345,10 +345,13 @@ func projectDirSources(projectDir string, includedBuilds []string) []tarSource {
 
 func main() {
 	cli := &CLI{}
-	kctx := kong.Parse(cli, kong.UsageOnError(), kong.HelpOptions{Compact: true})
-	setupLogger(cli.LogLevel)
 	ctx := context.Background()
-	kctx.BindTo(ctx, (*context.Context)(nil))
+	kctx := kong.Parse(cli,
+		kong.UsageOnError(),
+		kong.HelpOptions{Compact: true},
+		kong.BindTo(ctx, (*context.Context)(nil)), // needed by SaveCmd.AfterApply
+	)
+	setupLogger(cli.LogLevel)
 	kctx.FatalIfErrorf(kctx.Run(ctx))
 }
 
