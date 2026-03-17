@@ -30,16 +30,6 @@ func extractTarPlatformRouted(r io.Reader, targetFn func(string) string, skipExi
 	return extractTarSeqRouted(r, targetFn, skipExisting)
 }
 
-// extractTarSeq extracts a tar stream sequentially using a fixed-size copy
-// buffer. Files are streamed directly from the tar reader to disk one 1 MiB
-// block at a time — the same block-streaming pattern GNU tar uses — so the
-// decompressor pipe keeps flowing without large per-file allocations.
-func extractTarSeq(r io.Reader, dir string) error {
-	return extractTarSeqRouted(r, func(name string) string {
-		return filepath.Join(dir, name)
-	}, false)
-}
-
 // extractTarSeqRouted is the core sequential extractor. targetFn maps a
 // cleaned tar entry name (e.g. "caches/8.14.3/foo") to its absolute
 // destination path. skipExisting skips writing files that already exist.

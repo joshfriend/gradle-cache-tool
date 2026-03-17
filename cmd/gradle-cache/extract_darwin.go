@@ -45,24 +45,6 @@ func extractTarPlatformRouted(r io.Reader, targetFn func(string) string, skipExi
 	return extractTarGoRouted(r, targetFn, skipExisting)
 }
 
-// extractTarGo reads a tar stream and extracts it into dir using a Go worker
-// pool. Two macOS/APFS-specific optimisations over the naive implementation:
-//
-//  1. Directory creation is hoisted into the reader goroutine and tracked in a
-//     seen-set so each unique parent directory is MkdirAll'd exactly once.
-//     Workers never call MkdirAll, eliminating concurrent B-tree contention on
-//     APFS directory metadata.
-//
-//  2. Large files (>= mmapThreshold) are written via ftruncate + mmap + memcpy
-//     instead of write(). ftruncate tells APFS the final size upfront so it
-//     allocates one contiguous extent; the Mach VM subsystem then writes pages
-//     lazily via fault-in rather than blocking on each write() call.
-func extractTarGo(r io.Reader, dir string) error {
-	return extractTarGoRouted(r, func(name string) string {
-		return filepath.Join(dir, name)
-	}, false)
-}
-
 // extractTarGoRouted is the core parallel extractor. targetFn maps a cleaned
 // tar entry name (e.g. "caches/8.14.3/foo") to its absolute destination path.
 // skipExisting skips writing files that already exist on disk.
