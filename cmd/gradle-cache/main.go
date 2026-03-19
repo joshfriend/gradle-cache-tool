@@ -860,6 +860,30 @@ func zstdCompressCmd(ctx context.Context) *exec.Cmd {
 	return exec.CommandContext(ctx, "zstd", "-T"+n, "-c") //nolint:gosec
 }
 
+// cacheExclusions are patterns for files and directories that should never be
+// included in cache bundles. Patterns with a leading * are suffix-matched;
+// all others are exact basename matches.
+var cacheExclusions = []string{
+	"daemon",
+	".tmp",
+	"gc.properties",
+	"*.lock",
+}
+
+// isExcludedCache reports whether a file or directory name matches any cache exclusion pattern.
+func isExcludedCache(name string) bool {
+	for _, pat := range cacheExclusions {
+		if strings.HasPrefix(pat, "*") {
+			if strings.HasSuffix(name, pat[1:]) {
+				return true
+			}
+		} else if name == pat {
+			return true
+		}
+	}
+	return false
+}
+
 // createTarZstd creates a zstd-compressed tar archive from the given sources and
 // writes it to w. Uses -h to dereference symlinks.
 // Multiple sources map to multiple -C baseDir path entries in the tar command,
@@ -867,6 +891,9 @@ func zstdCompressCmd(ctx context.Context) *exec.Cmd {
 // archive.
 func createTarZstd(ctx context.Context, w io.Writer, sources []tarSource) error {
 	args := []string{"-chf", "-"}
+	for _, pat := range cacheExclusions {
+		args = append(args, "--exclude", pat)
+	}
 	for _, src := range sources {
 		args = append(args, "-C", src.BaseDir, src.Path)
 	}
@@ -949,10 +976,16 @@ func collectNewFiles(realCaches string, since time.Time, gradleHome string) ([]s
 				childRel = rel + "/" + name
 			}
 			if entry.IsDir() {
+				if isExcludedCache(name) {
+					continue
+				}
 				sem <- struct{}{} // acquire slot for child after releasing ours
 				wg.Add(1)
 				go walk(filepath.Join(dir, name), childRel)
 			} else if entry.Type().IsRegular() {
+				if isExcludedCache(name) {
+					continue
+				}
 				if fi, err := entry.Info(); err == nil && fi.ModTime().After(since) {
 					localFiles = append(localFiles, filepath.Join("caches", childRel))
 				}
