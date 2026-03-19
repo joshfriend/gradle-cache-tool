@@ -712,7 +712,7 @@ func main() {
 	)
 	setupLogger(cli.LogLevel)
 
-	metrics := cli.metricsFlags.newMetricsClient()
+	metrics := cli.newMetricsClient()
 	if metrics != nil {
 		defer metrics.close()
 	}

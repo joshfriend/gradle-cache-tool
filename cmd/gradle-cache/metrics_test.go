@@ -12,7 +12,7 @@ func TestStatsdClientTiming(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer pc.Close()
+	defer func() { _ = pc.Close() }()
 
 	addr := pc.LocalAddr().String()
 	client := newStatsdClient(addr, []string{"env:test"})
@@ -24,7 +24,7 @@ func TestStatsdClientTiming(t *testing.T) {
 	client.timing("gradle_cache.restore.duration_ms", 1234, "cache_key:foo")
 
 	buf := make([]byte, 1024)
-	pc.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_ = pc.SetReadDeadline(time.Now().Add(2 * time.Second))
 	n, _, err := pc.ReadFrom(buf)
 	if err != nil {
 		t.Fatal(err)
@@ -42,7 +42,7 @@ func TestStatsdClientGauge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer pc.Close()
+	defer func() { _ = pc.Close() }()
 
 	addr := pc.LocalAddr().String()
 	client := newStatsdClient(addr, nil)
@@ -54,7 +54,7 @@ func TestStatsdClientGauge(t *testing.T) {
 	client.gauge("gradle_cache.save.size_bytes", 5678)
 
 	buf := make([]byte, 1024)
-	pc.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_ = pc.SetReadDeadline(time.Now().Add(2 * time.Second))
 	n, _, err := pc.ReadFrom(buf)
 	if err != nil {
 		t.Fatal(err)

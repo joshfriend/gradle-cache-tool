@@ -18,8 +18,13 @@ jobs:
       - name: Install system dependencies
         run: sudo apt-get install -y zstd
 
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
       - name: Test
-        run: go test -run ^Test ./...
+        run: go test -run ^Test -timeout 300s ./...
 
       - name: Build
         run: go build ./...
