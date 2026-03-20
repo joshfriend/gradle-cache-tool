@@ -519,6 +519,22 @@ func (c *SaveCmd) Run(ctx context.Context, metrics metricsClient) error {
 
 	// Build the list of tar sources: always include caches, plus wrapper
 	// (if present), configuration-cache and convention build dirs.
+	//
+	// Other GRADLE_USER_HOME directories are intentionally excluded:
+	//   native/         - JNI libs for file-system watching and jansi; small,
+	//                     auto-extracted from jars on first run, version-locked.
+	//   daemon/         - Daemon registry, logs, and pid files; ephemeral
+	//                     per-process state that should not be shared.
+	//   notifications/  - Tracks "Welcome to Gradle" message display; trivial.
+	//   jdks/           - Auto-provisioned toolchain JDKs; CI images typically
+	//                     pre-install JDKs, and these are large version-specific
+	//                     downloads that don't benefit from per-commit caching.
+	//   build-scan-data/ - Unsent Develocity/Gradle Enterprise build scan data;
+	//                     ephemeral, should not be shared across builds.
+	//   develocity/     - Develocity plugin cache; ephemeral per-build state.
+	//   enterprise/     - Legacy Gradle Enterprise plugin cache; same as above.
+	//   android/        - Android Gradle Plugin's SDK/NDK component metadata;
+	//                     small, auto-populated from the installed SDK.
 	projectDir, err := os.Getwd()
 	if err != nil {
 		return errors.Wrap(err, "get working directory")
