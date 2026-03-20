@@ -516,7 +516,8 @@ func (c *s3Client) putStreamingMultipart(ctx context.Context, bucket, key string
 }
 
 // objectURL returns the virtual-hosted S3 URL for the given bucket and key.
-// Each path segment of the key is percent-encoded per RFC 3986.
+// Each path segment is percent-encoded using the AWS SigV4 URI encoding rules
+// (only A-Za-z0-9 - . _ ~ are left unencoded).
 func (c *s3Client) objectURL(bucket, key string) string {
 	var sb strings.Builder
 	sb.WriteString("https://")
@@ -526,7 +527,26 @@ func (c *s3Client) objectURL(bucket, key string) string {
 	sb.WriteString(".amazonaws.com")
 	for _, seg := range strings.Split(key, "/") {
 		sb.WriteByte('/')
-		sb.WriteString(url.PathEscape(seg))
+		sb.WriteString(s3PathEscape(seg))
+	}
+	return sb.String()
+}
+
+// s3PathEscape percent-encodes a single path segment using the AWS SigV4
+// URI encoding rules: unreserved characters (A-Za-z0-9 - . _ ~) are left
+// as-is; everything else (including colons) is percent-encoded.
+// This is stricter than url.PathEscape which also leaves sub-delimiters
+// like : ; @ ! unencoded.
+func s3PathEscape(s string) string {
+	var sb strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+			c == '-' || c == '.' || c == '_' || c == '~' {
+			sb.WriteByte(c)
+		} else {
+			fmt.Fprintf(&sb, "%%%02X", c)
+		}
 	}
 	return sb.String()
 }

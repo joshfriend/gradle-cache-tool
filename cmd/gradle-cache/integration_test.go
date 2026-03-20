@@ -213,6 +213,10 @@ func TestIntegrationGradleBuildCycle(t *testing.T) {
 		t.Fatalf("expected caches dir after restore: %v", err)
 	}
 
+	if _, err := os.Stat(filepath.Join(gradleUserHome, "wrapper")); err != nil {
+		t.Fatalf("expected wrapper dir after restore: %v", err)
+	}
+
 	ccRestored := filepath.Join(projectDir, ".gradle", "configuration-cache")
 	if _, err := os.Stat(ccRestored); err != nil {
 		t.Log("  configuration-cache dir was NOT restored")
@@ -223,6 +227,12 @@ func TestIntegrationGradleBuildCycle(t *testing.T) {
 	// ── Step 5: Rebuild and verify cache hits ────────────────────────────────
 	t.Log("Step 5: Rebuilding to verify cache hits...")
 	output := gradleRun(t, projectDir, gradlew, gradleUserHome, "build")
+
+	// Verify the wrapper was NOT re-downloaded — if it was, the bundle didn't
+	// include the wrapper directory (or the .ok marker file was missing).
+	if strings.Contains(output, "Downloading") {
+		t.Error("Gradle re-downloaded the wrapper distribution after restore; wrapper/ should be cached in the bundle")
+	}
 
 	if strings.Contains(output, "Reusing configuration cache") {
 		t.Log("  Configuration cache: reused")

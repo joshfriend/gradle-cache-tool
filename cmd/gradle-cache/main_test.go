@@ -63,6 +63,27 @@ func TestBundleFilename(t *testing.T) {
 	}
 }
 
+func TestS3PathEscape(t *testing.T) {
+	tests := []struct {
+		input, want string
+	}{
+		{"simple", "simple"},
+		{"apos-beta", "apos-beta"},
+		{"address-typeahead-sample:assembleDebug", "address-typeahead-sample%3AassembleDebug"},
+		{"a:b:c", "a%3Ab%3Ac"},
+		{":leadingColon", "%3AleadingColon"},
+		{"file.tar.zst", "file.tar.zst"},
+		{"with spaces", "with%20spaces"},
+		{"tilde~ok", "tilde~ok"},
+		{"hash#bad", "hash%23bad"},
+	}
+	for _, tt := range tests {
+		if got := s3PathEscape(tt.input); got != tt.want {
+			t.Errorf("s3PathEscape(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
 func TestS3Key(t *testing.T) {
 	tests := []struct {
 		commit, cacheKey, bundleFile, want string
@@ -463,8 +484,10 @@ func TestTarZstdRoundTrip(t *testing.T) {
 	must(t, os.WriteFile(filepath.Join(gradleHome, "caches", "8.14.3", "cc-keystore", "keystore.bin"), []byte("secret"), 0o644))
 
 	// wrapper/ source (under gradle-home) — includes a .zip that should be excluded
+	// and a .ok marker file that must be preserved (Gradle checks for it to skip re-downloading)
 	must(t, os.MkdirAll(filepath.Join(gradleHome, "wrapper", "dists", "gradle-8.14.3-bin", "abc123"), 0o755))
 	must(t, os.WriteFile(filepath.Join(gradleHome, "wrapper", "dists", "gradle-8.14.3-bin", "abc123", "gradle-8.14.3-bin.zip"), []byte("should be excluded"), 0o644))
+	must(t, os.WriteFile(filepath.Join(gradleHome, "wrapper", "dists", "gradle-8.14.3-bin", "abc123", "gradle-8.14.3-bin.zip.ok"), []byte(""), 0o644))
 	must(t, os.MkdirAll(filepath.Join(gradleHome, "wrapper", "dists", "gradle-8.14.3-bin", "abc123", "gradle-8.14.3", "lib"), 0o755))
 	must(t, os.WriteFile(filepath.Join(gradleHome, "wrapper", "dists", "gradle-8.14.3-bin", "abc123", "gradle-8.14.3", "lib", "gradle-core.jar"), []byte("wrapper data"), 0o644))
 
@@ -495,6 +518,7 @@ func TestTarZstdRoundTrip(t *testing.T) {
 	for _, rel := range []string{
 		"caches/modules/entry.bin",
 		"wrapper/dists/gradle-8.14.3-bin/abc123/gradle-8.14.3/lib/gradle-core.jar",
+		"wrapper/dists/gradle-8.14.3-bin/abc123/gradle-8.14.3-bin.zip.ok",
 		"configuration-cache/hash.bin",
 	} {
 		path := filepath.Join(dstDir, rel)
