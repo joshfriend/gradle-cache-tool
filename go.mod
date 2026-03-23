@@ -5,6 +5,7 @@ go 1.25.0
 require (
 	github.com/alecthomas/errors v0.9.1
 	github.com/alecthomas/kong v1.13.0
+	github.com/klauspost/compress v1.17.11
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.67.0
 	go.opentelemetry.io/otel v1.42.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.42.0

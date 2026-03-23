@@ -1,7 +1,9 @@
 // gradle-cache restores and saves Gradle build cache bundles from S3 or cachew.
 //
-// Base bundles are stored at s3://{bucket}/{commit}/{cache-key}/{bundle-file},
-// where bundle-file is the cache key with colons replaced by dashes + ".tar.zst".
+// Bundles are stored as single objects at
+// s3://{bucket}/{commit}/{cache-key}/{bundle-file}, where bundle-file is the
+// cache key with colons replaced by dashes + ".tar.zst". Restore uses parallel
+// range requests (many TCP connections) to saturate available network bandwidth.
 //
 // On restore, the tool walks the local git history (counting distinct-author
 // "blocks") to find the most recent S3 hit, downloads it, and extracts it
@@ -38,6 +40,7 @@ import (
 
 	"github.com/alecthomas/errors"
 	"github.com/alecthomas/kong"
+	"github.com/klauspost/compress/zstd"
 )
 
 type CLI struct {
@@ -241,9 +244,12 @@ func (c *RestoreCmd) Run(ctx context.Context, metrics metricsClient) error {
 	slog.Info("downloading bundle", "commit", hitCommit[:min(8, len(hitCommit))])
 
 	// Ensure GRADLE_USER_HOME exists before extracting into it.
+	// Track whether it was empty so we can skip per-file lstat calls below.
 	if err := os.MkdirAll(c.GradleUserHome, 0o750); err != nil {
 		return errors.Wrap(err, "create gradle user home dir")
 	}
+	entries, _ := os.ReadDir(c.GradleUserHome)
+	gradleUserHomeEmpty := len(entries) == 0
 
 	// Resolve the project directory upfront; bundle entries are routed here for
 	// configuration-cache and convention build dirs.
@@ -274,7 +280,9 @@ func (c *RestoreCmd) Run(ctx context.Context, metrics metricsClient) error {
 	// countingBody records bytes consumed and timestamps when the S3 body is
 	// exhausted so we can log download speed independently of extraction.
 	cb := &countingBody{r: body, dlStart: dlStart}
-	if err := extractBundleZstd(ctx, cb, rules, projectDir); err != nil {
+	// Skip per-file lstat when GRADLE_USER_HOME was empty: no existing files
+	// can conflict, so the 334K stat() calls are pure overhead.
+	if err := extractBundleZstd(ctx, cb, rules, projectDir, !gradleUserHomeEmpty); err != nil {
 		return errors.Wrap(err, "extract bundle")
 	}
 
@@ -347,27 +355,24 @@ type extractRule struct {
 
 // extractBundleZstd decompresses and extracts a base bundle, routing tar
 // entries to their final destinations based on rules. Any entry whose path does
-// not match a rule is placed under defaultDir. Existing files are not
-// overwritten (skipExisting semantics), so a partial pre-existing cache is
-// merged rather than replaced.
-func extractBundleZstd(ctx context.Context, r io.Reader, rules []extractRule, defaultDir string) error {
-	zstdCmd := zstdDecompressCmd(ctx)
-	// Buffer between S3 download and pzstd to decouple network I/O from
-	// decompression. Without this, any momentary pause in pzstd (context
-	// switch, hard block) stalls the S3 read on the synchronous pipe.
-	zstdCmd.Stdin = bufio.NewReaderSize(r, 8<<20)
-
-	var zstdStderr bytes.Buffer
-	zstdCmd.Stderr = &zstdStderr
-
-	zstdOut, err := zstdCmd.StdoutPipe()
+// not match a rule is placed under defaultDir. skipExisting controls whether
+// files that already exist at the destination are left untouched (true) or
+// overwritten (false). Pass false for a fresh empty destination to skip the
+// per-file lstat syscall for each of the ~334K entries.
+//
+// Decompression uses the in-process Go zstd decoder to avoid subprocess IPC
+// overhead (no kernel pipes, no process spawning, no goroutine synchronization
+// across process boundaries).
+func extractBundleZstd(_ context.Context, r io.Reader, rules []extractRule, defaultDir string, skipExisting bool) error {
+	// Buffer between the S3 download pipe and the zstd decoder. The io.Pipe
+	// from parallelGet is synchronous (zero-copy, one Read per Write), so
+	// without buffering each small decoder read stalls the download goroutine.
+	// 8 MiB lets the decoder read ahead while the download fills the next chunk.
+	dec, err := zstd.NewReader(bufio.NewReaderSize(r, 8<<20), zstd.WithDecoderConcurrency(runtime.NumCPU()))
 	if err != nil {
-		return errors.Wrap(err, "zstd stdout pipe")
+		return errors.Wrap(err, "create zstd decoder")
 	}
-
-	if err := zstdCmd.Start(); err != nil {
-		return errors.Wrap(err, "start zstd")
-	}
+	defer dec.Close()
 
 	targetFn := func(name string) string {
 		for _, rule := range rules {
@@ -378,17 +383,7 @@ func extractBundleZstd(ctx context.Context, r io.Reader, rules []extractRule, de
 		return filepath.Join(defaultDir, name)
 	}
 
-	extractErr := extractTarPlatformRouted(zstdOut, targetFn, true)
-	zstdErr := zstdCmd.Wait()
-
-	var errs []error
-	if extractErr != nil {
-		errs = append(errs, extractErr)
-	}
-	if zstdErr != nil {
-		errs = append(errs, errors.Errorf("zstd: %w: %s", zstdErr, zstdStderr.String()))
-	}
-	return errors.Join(errs...)
+	return extractTarPlatformRouted(dec, targetFn, skipExisting)
 }
 
 // RestoreDeltaCmd downloads and applies a branch-specific delta bundle on top of
@@ -727,6 +722,12 @@ func projectDirSources(projectDir string, includedBuilds []string) []tarSource {
 }
 
 func main() {
+	// Override GOMAXPROCS: the environment may set it to a small value (e.g. 2)
+	// that starves the zstd decoder and tar pipeline when competing with the
+	// file-writing goroutine pool. Using all available CPUs gives the decoder
+	// and scheduler room to run at full throughput.
+	runtime.GOMAXPROCS(runtime.NumCPU())
+
 	cli := &CLI{}
 	ctx := context.Background()
 	kctx := kong.Parse(cli,
@@ -843,22 +844,7 @@ func isFullSHA(s string) bool {
 	return true
 }
 
-// zstdDecompressArgs returns the command + args for zstd decompression.
-// Prefers pzstd (parallel, same format as pzstd-compressed bundles) and
-// falls back to zstd -dc -TN.
-func zstdDecompressCmd(ctx context.Context) *exec.Cmd {
-	n := strconv.Itoa(max(1, runtime.NumCPU()))
-	if path, err := exec.LookPath("pzstd"); err == nil {
-		// -d decompress, -p N = N threads, -c write to stdout
-		return exec.CommandContext(ctx, path, "-d", "-p", n, "-c") //nolint:gosec
-	}
-	return exec.CommandContext(ctx, "zstd", "-dc", "-T"+n) //nolint:gosec
-}
-
 // extractTarZstd decompresses a zstd-compressed tar archive from r into dir.
-// pzstd/zstd decompresses in parallel; the resulting tar stream is extracted
-// by extractTarGo (pooled-buffer parallel writer) or piped to system tar as
-// a fallback when building without CGO on platforms where tar is unavailable.
 // countingBody wraps an io.Reader, counts bytes consumed, and records the time
 // at which the underlying reader returns io.EOF (i.e. when the last S3 byte
 // was consumed by the downstream pipeline).
@@ -878,33 +864,13 @@ func (c *countingBody) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func extractTarZstd(ctx context.Context, r io.Reader, dir string) error {
-	zstdCmd := zstdDecompressCmd(ctx)
-	zstdCmd.Stdin = bufio.NewReaderSize(r, 8<<20)
-
-	var zstdStderr bytes.Buffer
-	zstdCmd.Stderr = &zstdStderr
-
-	zstdOut, err := zstdCmd.StdoutPipe()
+func extractTarZstd(_ context.Context, r io.Reader, dir string) error {
+	dec, err := zstd.NewReader(r, zstd.WithDecoderConcurrency(runtime.NumCPU()))
 	if err != nil {
-		return errors.Wrap(err, "zstd stdout pipe")
+		return errors.Wrap(err, "create zstd decoder")
 	}
-
-	if err := zstdCmd.Start(); err != nil {
-		return errors.Wrap(err, "start zstd")
-	}
-
-	extractErr := extractTarPlatform(zstdOut, dir)
-	zstdErr := zstdCmd.Wait()
-
-	var errs []error
-	if extractErr != nil {
-		errs = append(errs, extractErr)
-	}
-	if zstdErr != nil {
-		errs = append(errs, errors.Errorf("zstd: %w: %s", zstdErr, zstdStderr.String()))
-	}
-	return errors.Join(errs...)
+	defer dec.Close()
+	return extractTarPlatform(dec, dir)
 }
 
 // zstdCompressCmd returns the command for zstd compression.
