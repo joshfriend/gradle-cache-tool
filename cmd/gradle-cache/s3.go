@@ -465,11 +465,17 @@ func (c *s3Client) putStreamingMultipart(ctx context.Context, bucket, key string
 	}
 
 	// Reader goroutine: split input into uploadPartSize chunks and dispatch.
+	// The buffered reader decouples the upstream pipe (zero-buffer io.Pipe
+	// from createTarZstd) from the chunking loop. Without it, when the reader
+	// blocks on a full jobs channel the archive goroutine stalls because
+	// nobody is consuming the pipe. The 8 MiB buffer absorbs ongoing
+	// archive output during those brief stalls.
+	br := bufio.NewReaderSize(r, 8<<20)
 	go func() {
 		partNum := 1
 		for {
 			buf := make([]byte, uploadPartSize)
-			n, err := io.ReadFull(r, buf)
+			n, err := io.ReadFull(br, buf)
 			if n > 0 {
 				jobs <- partJob{num: partNum, data: buf[:n]}
 				partNum++
