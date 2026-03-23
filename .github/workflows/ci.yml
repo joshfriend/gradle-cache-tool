@@ -37,6 +37,9 @@ jobs:
       - name: Activate Hermit
         run: echo "${GITHUB_WORKSPACE}/bin" >> "$GITHUB_PATH"
 
+      - name: Install Go (hermit)
+        run: go version
+
       - name: Lint
         run: golangci-lint run
 
