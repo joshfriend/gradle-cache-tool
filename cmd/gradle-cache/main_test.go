@@ -1166,7 +1166,7 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.mpUploads[uploadID] = make(map[int][]byte)
 		f.mpKeys[uploadID] = key
 		f.mu.Unlock()
-		fmt.Fprintf(w, `<InitiateMultipartUploadResult><UploadId>%s</UploadId></InitiateMultipartUploadResult>`, uploadID)
+		_, _ = fmt.Fprintf(w, `<InitiateMultipartUploadResult><UploadId>%s</UploadId></InitiateMultipartUploadResult>`, uploadID)
 
 	case r.Method == http.MethodPost && q.Get("uploadId") != "":
 		// CompleteMultipartUpload: assemble parts in order
@@ -1191,7 +1191,7 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		f.objects[objKey] = assembled
 		f.mu.Unlock()
-		fmt.Fprintf(w, `<CompleteMultipartUploadResult><Key>%s</Key></CompleteMultipartUploadResult>`, objKey)
+		_, _ = fmt.Fprintf(w, `<CompleteMultipartUploadResult><Key>%s</Key></CompleteMultipartUploadResult>`, objKey)
 
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
