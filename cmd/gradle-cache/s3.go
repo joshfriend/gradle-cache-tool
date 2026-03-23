@@ -17,7 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
+
 	"sort"
 	"strings"
 	"sync"
@@ -47,22 +47,20 @@ func newS3Client(region string) (*s3Client, error) {
 	if err != nil {
 		return nil, errors.Wrap(err, "resolve AWS credentials")
 	}
-	workers := max(defaultDownloadWorkers, runtime.NumCPU())
-
 	transport := &http.Transport{
-		MaxIdleConnsPerHost: workers,
+		MaxIdleConnsPerHost: defaultDownloadWorkers,
 		WriteBufferSize:     128 << 10,
 		ReadBufferSize:      128 << 10,
 	}
 
-	slog.Debug("s3 client config", "workers", workers, "chunk_mb", defaultDownloadChunkSize>>20)
+	slog.Debug("s3 client config", "workers", defaultDownloadWorkers, "chunk_mb", defaultDownloadChunkSize>>20)
 
 	return &s3Client{
 		region:    region,
 		creds:     creds,
 		http:      &http.Client{Transport: transport},
 		chunkSize: defaultDownloadChunkSize,
-		dlWorkers: workers,
+		dlWorkers: defaultDownloadWorkers,
 	}, nil
 }
 
@@ -88,7 +86,7 @@ func (c *s3Client) stat(ctx context.Context, bucket, key string) (int64, error) 
 
 const (
 	defaultDownloadChunkSize = 32 << 20
-	defaultDownloadWorkers   = 16
+	defaultDownloadWorkers   = 64
 )
 
 // get downloads an object and returns its body as a streaming ReadCloser.
@@ -132,7 +130,7 @@ func (c *s3Client) get(ctx context.Context, bucket, key string, size int64) (io.
 // available S3 bandwidth. Peak memory is numWorkers × downloadChunkSize.
 func (c *s3Client) parallelGet(ctx context.Context, bucket, key string, size int64, w io.Writer) error {
 	numChunks := int((size + c.chunkSize - 1) / c.chunkSize)
-	numWorkers := max(c.dlWorkers, runtime.NumCPU())
+	numWorkers := c.dlWorkers
 
 	type chunkResult struct {
 		data []byte
