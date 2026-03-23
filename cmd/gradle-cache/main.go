@@ -721,11 +721,12 @@ func projectDirSources(projectDir string, includedBuilds []string) []tarSource {
 }
 
 func main() {
-	// Override GOMAXPROCS: the environment may set it to a small value (e.g. 2)
-	// that starves the zstd decoder and tar pipeline when competing with the
-	// file-writing goroutine pool. Using all available CPUs gives the decoder
-	// and scheduler room to run at full throughput.
-	runtime.GOMAXPROCS(runtime.NumCPU())
+	// Ensure GOMAXPROCS is at least 32 for I/O-bound workloads, regardless
+	// of cgroup CPU limits. The file-write goroutine pool and zstd decoder
+	// need OS threads for blocking syscalls, not CPU time.
+	if runtime.GOMAXPROCS(0) < 32 {
+		runtime.GOMAXPROCS(32)
+	}
 
 	cli := &CLI{}
 	ctx := context.Background()
