@@ -301,8 +301,13 @@ func (c *RestoreCmd) Run(ctx context.Context, metrics metricsClient) error {
 	// total ≈ download time + a small flush of buffered pipeline stages.
 	slog.Info("restore pipeline complete",
 		"total_duration", totalElapsed.Round(time.Millisecond))
-	emitTiming(metrics, "gradle_cache.restore.duration_ms", totalElapsed.Milliseconds(), "cache_key:"+c.CacheKey)
-	emitGauge(metrics, "gradle_cache.restore.size_bytes", cb.n, "cache_key:"+c.CacheKey)
+	metrics.distribution("gradle_cache.restore.duration_ms", float64(totalElapsed.Milliseconds()), "cache_key:"+c.CacheKey)
+	metrics.distribution("gradle_cache.restore.size_bytes", float64(cb.n), "cache_key:"+c.CacheKey)
+	if !cb.eofAt.IsZero() {
+		dlElapsed := cb.eofAt.Sub(dlStart)
+		mbps := float64(cb.n) / dlElapsed.Seconds() / 1e6
+		metrics.distribution("gradle_cache.restore.speed_mbps", mbps, "cache_key:"+c.CacheKey)
+	}
 
 	// Write a marker recording when the base restore finished.
 	// save-delta compares file mtimes against this to identify files created
@@ -458,8 +463,16 @@ func (c *RestoreDeltaCmd) Run(ctx context.Context, metrics metricsClient) error 
 	deltaElapsed := time.Since(dlStart)
 	slog.Info("applied delta bundle", "branch", c.Branch, "cache-key", c.CacheKey,
 		"total_duration", deltaElapsed.Round(time.Millisecond))
-	emitTiming(metrics, "gradle_cache.restore_delta.duration_ms", deltaElapsed.Milliseconds(),
-		"cache_key:"+c.CacheKey, "branch:"+c.Branch)
+	metrics.distribution("gradle_cache.restore_delta.duration_ms", float64(deltaElapsed.Milliseconds()),
+		"cache_key:"+c.CacheKey)
+	metrics.distribution("gradle_cache.restore_delta.size_bytes", float64(cb.n),
+		"cache_key:"+c.CacheKey)
+	if !cb.eofAt.IsZero() {
+		dlElapsed := cb.eofAt.Sub(dlStart)
+		mbps := float64(cb.n) / dlElapsed.Seconds() / 1e6
+		metrics.distribution("gradle_cache.restore_delta.speed_mbps", mbps,
+			"cache_key:"+c.CacheKey)
+	}
 	return nil
 }
 
@@ -580,8 +593,9 @@ func (c *SaveCmd) Run(ctx context.Context, metrics metricsClient) error {
 		"size_mb", fmt.Sprintf("%.1f", float64(size)/1e6),
 		"speed_mbps", fmt.Sprintf("%.1f", mbps))
 	slog.Info("saved bundle", "commit", c.Commit[:min(8, len(c.Commit))], "cache-key", c.CacheKey)
-	emitTiming(metrics, "gradle_cache.save.duration_ms", elapsed.Milliseconds(), "cache_key:"+c.CacheKey)
-	emitGauge(metrics, "gradle_cache.save.size_bytes", size, "cache_key:"+c.CacheKey)
+	metrics.distribution("gradle_cache.save.duration_ms", float64(elapsed.Milliseconds()), "cache_key:"+c.CacheKey)
+	metrics.distribution("gradle_cache.save.size_bytes", float64(size), "cache_key:"+c.CacheKey)
+	metrics.distribution("gradle_cache.save.speed_mbps", mbps, "cache_key:"+c.CacheKey)
 	return nil
 }
 
@@ -692,10 +706,12 @@ func (c *SaveDeltaCmd) Run(ctx context.Context, metrics metricsClient) error {
 		"duration", elapsed.Round(time.Millisecond),
 		"size_mb", fmt.Sprintf("%.1f", float64(size)/1e6),
 		"speed_mbps", fmt.Sprintf("%.1f", mbps))
-	emitTiming(metrics, "gradle_cache.save_delta.duration_ms", elapsed.Milliseconds(),
-		"cache_key:"+c.CacheKey, "branch:"+c.Branch)
-	emitGauge(metrics, "gradle_cache.save_delta.size_bytes", size,
-		"cache_key:"+c.CacheKey, "branch:"+c.Branch)
+	metrics.distribution("gradle_cache.save_delta.duration_ms", float64(elapsed.Milliseconds()),
+		"cache_key:"+c.CacheKey)
+	metrics.distribution("gradle_cache.save_delta.size_bytes", float64(size),
+		"cache_key:"+c.CacheKey)
+	metrics.distribution("gradle_cache.save_delta.speed_mbps", mbps,
+		"cache_key:"+c.CacheKey)
 	return nil
 }
 

@@ -13,12 +13,11 @@ import (
 	"time"
 )
 
-// metricsClient emits timing and gauge metrics to a backend.
+// metricsClient emits distribution metrics to a backend.
+// All metrics are submitted as distributions to support percentile aggregation.
 type metricsClient interface {
-	// timing records a duration metric in milliseconds.
-	timing(name string, ms int64, tags ...string)
-	// gauge records a point-in-time value.
-	gauge(name string, value int64, tags ...string)
+	// distribution records a single sample for a distribution metric.
+	distribution(name string, value float64, tags ...string)
 	// close flushes any pending data.
 	close()
 }
@@ -27,9 +26,8 @@ type metricsClient interface {
 // It exists because kong cannot bind a nil interface value.
 type noopMetrics struct{}
 
-func (noopMetrics) timing(string, int64, ...string) {}
-func (noopMetrics) gauge(string, int64, ...string)  {}
-func (noopMetrics) close()                          {}
+func (noopMetrics) distribution(string, float64, ...string) {}
+func (noopMetrics) close()                                  {}
 
 // metricsFlags are CLI flags for configuring metrics emission.
 type metricsFlags struct {
@@ -94,12 +92,8 @@ func newStatsdClient(addr string, baseTags []string) *statsdClient {
 	return &statsdClient{conn: conn, tags: baseTags}
 }
 
-func (s *statsdClient) timing(name string, ms int64, tags ...string) {
-	s.send(fmt.Sprintf("%s:%d|d", name, ms), tags) // |d = distribution for DD percentile support
-}
-
-func (s *statsdClient) gauge(name string, value int64, tags ...string) {
-	s.send(fmt.Sprintf("%s:%d|g", name, value), tags)
+func (s *statsdClient) distribution(name string, value float64, tags ...string) {
+	s.send(fmt.Sprintf("%s:%g|d", name, value), tags)
 }
 
 func (s *statsdClient) send(stat string, extraTags []string) {
@@ -114,9 +108,9 @@ func (s *statsdClient) close() {
 	s.conn.Close() //nolint:errcheck,gosec
 }
 
-// ── DataDog HTTP API ────────────────────────────────────────────────────────
+// ── DataDog HTTP API (v1 distribution_points) ───────────────────────────────
 
-const datadogSeriesURL = "https://api.datadoghq.com/api/v2/series"
+const datadogDistURL = "https://api.datadoghq.com/api/v1/distribution_points"
 
 type datadogAPIClient struct {
 	apiKey string
@@ -132,34 +126,17 @@ func newDatadogAPIClient(apiKey string, baseTags []string) *datadogAPIClient {
 	}
 }
 
-// Datadog v2 metric type enum values.
-const (
-	ddMetricTypeGauge = 3
-	ddMetricTypeCount = 1
-)
-
-func (d *datadogAPIClient) timing(name string, ms int64, tags ...string) {
-	d.submit(name, float64(ms), ddMetricTypeGauge, tags)
-}
-
-func (d *datadogAPIClient) gauge(name string, value int64, tags ...string) {
-	d.submit(name, float64(value), ddMetricTypeGauge, tags)
-}
-
-func (d *datadogAPIClient) submit(name string, value float64, metricType int, extraTags []string) {
-	allTags := append(d.tags, extraTags...)
+func (d *datadogAPIClient) distribution(name string, value float64, tags ...string) {
+	allTags := append(d.tags, tags...)
 	now := time.Now().Unix()
 
+	// v1 distribution_points format: points is [[timestamp, [value, ...]]]
 	payload := map[string]interface{}{
 		"series": []map[string]interface{}{
 			{
 				"metric": name,
-				"type":   metricType,
-				"points": []map[string]interface{}{
-					{
-						"timestamp": now,
-						"value":     value,
-					},
+				"points": []interface{}{
+					[]interface{}{now, []float64{value}},
 				},
 				"tags": allTags,
 			},
@@ -172,7 +149,7 @@ func (d *datadogAPIClient) submit(name string, value float64, metricType int, ex
 		return
 	}
 
-	req, err := http.NewRequest("POST", datadogSeriesURL, bytes.NewReader(body))
+	req, err := http.NewRequest("POST", datadogDistURL, bytes.NewReader(body))
 	if err != nil {
 		slog.Warn("metrics: failed to create request", "error", err)
 		return
@@ -193,11 +170,3 @@ func (d *datadogAPIClient) submit(name string, value float64, metricType int, ex
 }
 
 func (d *datadogAPIClient) close() {}
-
-func emitTiming(m metricsClient, name string, ms int64, tags ...string) {
-	m.timing(name, ms, tags...)
-}
-
-func emitGauge(m metricsClient, name string, value int64, tags ...string) {
-	m.gauge(name, value, tags...)
-}

@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-func TestStatsdClientTiming(t *testing.T) {
+func TestStatsdClientDistribution(t *testing.T) {
 	// Start a UDP listener to capture the statsd packet.
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
@@ -21,7 +21,7 @@ func TestStatsdClientTiming(t *testing.T) {
 	}
 	defer client.close()
 
-	client.timing("gradle_cache.restore.duration_ms", 1234, "cache_key:foo")
+	client.distribution("gradle_cache.restore.duration_ms", 1234, "cache_key:foo")
 
 	buf := make([]byte, 1024)
 	_ = pc.SetReadDeadline(time.Now().Add(2 * time.Second))
@@ -37,7 +37,7 @@ func TestStatsdClientTiming(t *testing.T) {
 	}
 }
 
-func TestStatsdClientGauge(t *testing.T) {
+func TestStatsdClientDistributionFloat(t *testing.T) {
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -51,7 +51,7 @@ func TestStatsdClientGauge(t *testing.T) {
 	}
 	defer client.close()
 
-	client.gauge("gradle_cache.save.size_bytes", 5678)
+	client.distribution("gradle_cache.restore.speed_mbps", 155.6)
 
 	buf := make([]byte, 1024)
 	_ = pc.SetReadDeadline(time.Now().Add(2 * time.Second))
@@ -61,7 +61,7 @@ func TestStatsdClientGauge(t *testing.T) {
 	}
 
 	got := string(buf[:n])
-	want := "gradle_cache.save.size_bytes:5678|g"
+	want := "gradle_cache.restore.speed_mbps:155.6|d"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
@@ -70,8 +70,7 @@ func TestStatsdClientGauge(t *testing.T) {
 func TestNoopMetrics(t *testing.T) {
 	// noopMetrics should not panic.
 	var m metricsClient = noopMetrics{}
-	emitTiming(m, "test.metric", 100)
-	emitGauge(m, "test.metric", 200)
+	m.distribution("test.metric", 100)
 	m.close()
 }
 
