@@ -161,6 +161,27 @@ readLoop:
 				readErr = errors.Errorf("symlink %s → %s: %w", hdr.Name, hdr.Linkname, err)
 				break readLoop
 			}
+
+		case tar.TypeLink:
+			if skipExisting {
+				if _, err := os.Lstat(target); err == nil {
+					continue
+				}
+			}
+			linkName, err := safeTarEntryName(hdr.Linkname)
+			if err != nil {
+				readErr = errors.Errorf("unsafe hardlink target %q: %w", hdr.Linkname, err)
+				break readLoop
+			}
+			linkTarget := targetFn(linkName)
+			if err := ensureDir(filepath.Dir(target), 0o755); err != nil {
+				readErr = errors.Errorf("mkdir for hardlink %s: %w", hdr.Name, err)
+				break readLoop
+			}
+			if err := os.Link(linkTarget, target); err != nil {
+				readErr = errors.Errorf("hardlink %s → %s: %w", hdr.Name, hdr.Linkname, err)
+				break readLoop
+			}
 		}
 	}
 
