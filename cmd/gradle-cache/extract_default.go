@@ -7,26 +7,26 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 
 	"github.com/alecthomas/errors"
 )
 
 const (
-	// extractWorkers is the number of goroutines writing files concurrently
-	// during parallel tar extraction. Hides per-file open/write/close syscall
-	// latency so the tar-stream reader (and download pipeline behind it) is not
-	// stalled waiting for individual file writes to complete.
-	// Benchmarked on r8id.metal-48xlarge (NVMe, 96 cores) with a 334K-file
-	// bundle: 64 workers = 6.27s, 128 = 6.84s (extra GC pressure outweighs
-	// any I/O concurrency gain).
-	extractWorkers = 64
 	// maxParallelFileSize is the largest file that will be buffered in memory
 	// and dispatched to the worker pool. Files larger than this are written
 	// inline in the main goroutine to keep peak memory bounded.
 	// At 4 MiB, 99.97 % of Gradle cache entries go through the parallel path.
 	maxParallelFileSize = 4 << 20 // 4 MiB
 )
+
+// extractWorkerCount returns the number of parallel file-write goroutines.
+// Scales with available CPUs to avoid over-subscription on smaller machines
+// and k8s pods where other processes run concurrently.
+func extractWorkerCount() int {
+	return max(16, runtime.NumCPU())
+}
 
 // extractTarPlatform uses parallel extraction on Linux.
 // See extractTarParallelRouted for the implementation rationale.
@@ -59,7 +59,8 @@ func extractTarParallelRouted(r io.Reader, targetFn func(string) string, skipExi
 		data   []byte
 	}
 
-	jobs := make(chan writeJob, extractWorkers*2)
+	numWorkers := extractWorkerCount()
+	jobs := make(chan writeJob, numWorkers*2)
 
 	var (
 		wg           sync.WaitGroup
@@ -67,7 +68,7 @@ func extractTarParallelRouted(r io.Reader, targetFn func(string) string, skipExi
 		writeErr     error
 	)
 
-	for range extractWorkers {
+	for range numWorkers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
