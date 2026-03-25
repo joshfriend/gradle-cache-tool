@@ -1,4 +1,5 @@
-// gradle-cache restores and saves Gradle build cache bundles from S3 or cachew.
+// gradle-cache restores and saves Gradle build cache bundles from S3, cachew,
+// or the GitHub Actions cache.
 //
 // Bundles are stored as single objects at
 // s3://{bucket}/{commit}/{cache-key}/{bundle-file}, where bundle-file is the
@@ -52,9 +53,10 @@ type CLI struct {
 }
 
 type backendFlags struct {
-	Bucket    string `help:"S3 bucket name."`
-	Region    string `help:"AWS region." default:"us-west-2"`
-	CachewURL string `help:"Cachew server URL (e.g. http://localhost:8080). Mutually exclusive with --bucket." name:"cachew-url"`
+	Bucket        string `help:"S3 bucket name."`
+	Region        string `help:"AWS region." default:"us-west-2"`
+	CachewURL     string `help:"Cachew server URL (e.g. http://localhost:8080). Mutually exclusive with --bucket." name:"cachew-url"`
+	GitHubActions bool   `help:"Use the GitHub Actions cache as the storage backend (auto-detected from ACTIONS_CACHE_URL)." name:"github-actions"`
 }
 
 // bundleStore abstracts over S3 and cachew as storage backends for Gradle cache bundles.
@@ -90,7 +92,30 @@ func (s *s3BundleStore) putStream(ctx context.Context, commit, cacheKey string, 
 	return s.client.putStreamingMultipart(ctx, s.bucket, s3Key(commit, cacheKey, bundleFilename(cacheKey)), r, "application/zstd")
 }
 
+func (f *backendFlags) validate() error {
+	backends := 0
+	if f.Bucket != "" {
+		backends++
+	}
+	if f.CachewURL != "" {
+		backends++
+	}
+	if f.GitHubActions {
+		backends++
+	}
+	if backends == 0 {
+		return errors.New("one of --bucket, --cachew-url, or --github-actions is required")
+	}
+	if backends > 1 {
+		return errors.New("--bucket, --cachew-url, and --github-actions are mutually exclusive")
+	}
+	return nil
+}
+
 func (f *backendFlags) newStore() (bundleStore, error) {
+	if f.GitHubActions {
+		return newGHACacheStore()
+	}
 	if f.CachewURL != "" {
 		return newCachewClient(f.CachewURL), nil
 	}
@@ -110,7 +135,7 @@ func (f *backendFlags) newStore() (bundleStore, error) {
 // collapsing the two-step restore/restore-delta workflow into a single invocation.
 type RestoreCmd struct {
 	backendFlags
-	CacheKey       string   `help:"Bundle identifier, e.g. 'my-project:assembleRelease'." required:""`
+	CacheKey       string   `help:"Bundle identifier. Defaults to 'gradle'." default:"gradle"`
 	GitDir         string   `help:"Path to the git repository used for history walking." default:"." type:"path"`
 	Ref            string   `help:"Git ref to start the history walk from." default:"HEAD"`
 	Commit         string   `help:"Specific commit SHA to try directly, skipping history walk."`
@@ -131,11 +156,8 @@ func (c *RestoreCmd) AfterApply() error {
 	if len(c.IncludedBuilds) == 0 {
 		c.IncludedBuilds = []string{"buildSrc"}
 	}
-	if c.Bucket == "" && c.CachewURL == "" {
-		return errors.New("one of --bucket or --cachew-url is required")
-	}
-	if c.Bucket != "" && c.CachewURL != "" {
-		return errors.New("--bucket and --cachew-url are mutually exclusive")
+	if err := c.validate(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -398,7 +420,7 @@ func extractBundleZstd(_ context.Context, r io.Reader, rules []extractRule, defa
 // force-pushes and rebases that rewrite the branch tip.
 type RestoreDeltaCmd struct {
 	backendFlags
-	CacheKey       string `help:"Bundle identifier, e.g. 'my-project:assembleRelease'." required:""`
+	CacheKey       string `help:"Bundle identifier. Defaults to 'gradle'." default:"gradle"`
 	Branch         string `help:"Branch name to look up a delta for (typically $BRANCH_NAME / $GIT_BRANCH)." required:""`
 	GradleUserHome string `help:"Path to GRADLE_USER_HOME." env:"GRADLE_USER_HOME"`
 }
@@ -411,13 +433,7 @@ func (c *RestoreDeltaCmd) AfterApply() error {
 		}
 		c.GradleUserHome = filepath.Join(home, ".gradle")
 	}
-	if c.Bucket == "" && c.CachewURL == "" {
-		return errors.New("one of --bucket or --cachew-url is required")
-	}
-	if c.Bucket != "" && c.CachewURL != "" {
-		return errors.New("--bucket and --cachew-url are mutually exclusive")
-	}
-	return nil
+	return c.validate()
 }
 
 func (c *RestoreDeltaCmd) Run(ctx context.Context, metrics metricsClient) error {
@@ -480,7 +496,7 @@ func (c *RestoreDeltaCmd) Run(ctx context.Context, metrics metricsClient) error 
 // Also includes configuration-cache and included build output dirs if they exist.
 type SaveCmd struct {
 	backendFlags
-	CacheKey       string   `help:"Bundle identifier, e.g. 'my-project:assembleRelease'." required:""`
+	CacheKey       string   `help:"Bundle identifier. Defaults to 'gradle'." default:"gradle"`
 	Commit         string   `help:"Commit SHA to tag this bundle with. Defaults to HEAD of --git-dir."`
 	GitDir         string   `help:"Path to the git repository (used to resolve HEAD when --commit is not set)." default:"." type:"path"`
 	GradleUserHome string   `help:"Path to GRADLE_USER_HOME." env:"GRADLE_USER_HOME"`
@@ -508,13 +524,7 @@ func (c *SaveCmd) AfterApply(ctx context.Context) error {
 	if !isFullSHA(c.Commit) {
 		return errors.Errorf("--commit must be a full 40-character hex SHA, got %q", c.Commit)
 	}
-	if c.Bucket == "" && c.CachewURL == "" {
-		return errors.New("one of --bucket or --cachew-url is required")
-	}
-	if c.Bucket != "" && c.CachewURL != "" {
-		return errors.New("--bucket and --cachew-url are mutually exclusive")
-	}
-	return nil
+	return c.validate()
 }
 
 func (c *SaveCmd) Run(ctx context.Context, metrics metricsClient) error {
@@ -610,8 +620,9 @@ func (c *SaveCmd) Run(ctx context.Context, metrics metricsClient) error {
 // is therefore a cumulative snapshot of all files added since the base restore.
 type SaveDeltaCmd struct {
 	backendFlags
-	CacheKey       string `help:"Bundle identifier, e.g. 'my-project:assembleRelease'." required:""`
+	CacheKey       string `help:"Bundle identifier. Defaults to 'gradle'." default:"gradle"`
 	Branch         string `help:"Branch name to save the delta under (typically $BRANCH_NAME / $GIT_BRANCH)." required:""`
+	GitDir         string `help:"Path to the git repository (used to resolve HEAD when falling back to full save)." default:"." type:"path"`
 	GradleUserHome string `help:"Path to GRADLE_USER_HOME." env:"GRADLE_USER_HOME"`
 }
 
@@ -623,13 +634,7 @@ func (c *SaveDeltaCmd) AfterApply() error {
 		}
 		c.GradleUserHome = filepath.Join(home, ".gradle")
 	}
-	if c.Bucket == "" && c.CachewURL == "" {
-		return errors.New("one of --bucket or --cachew-url is required")
-	}
-	if c.Bucket != "" && c.CachewURL != "" {
-		return errors.New("--bucket and --cachew-url are mutually exclusive")
-	}
-	return nil
+	return c.validate()
 }
 
 func (c *SaveDeltaCmd) Run(ctx context.Context, metrics metricsClient) error {
@@ -637,7 +642,17 @@ func (c *SaveDeltaCmd) Run(ctx context.Context, metrics metricsClient) error {
 	markerPath := filepath.Join(c.GradleUserHome, ".cache-restore-marker")
 	markerInfo, err := os.Stat(markerPath)
 	if err != nil {
-		return errors.Errorf("restore marker not found at %s — run restore first: %w", markerPath, err)
+		slog.Warn("restore marker not found, falling back to full save", "path", markerPath)
+		save := &SaveCmd{
+			backendFlags:   c.backendFlags,
+			CacheKey:       c.CacheKey,
+			GitDir:         c.GitDir,
+			GradleUserHome: c.GradleUserHome,
+		}
+		if err := save.AfterApply(ctx); err != nil {
+			return errors.Wrap(err, "prepare full save fallback")
+		}
+		return save.Run(ctx, metrics)
 	}
 	since := markerInfo.ModTime()
 	slog.Debug("scanning for new cache files", "since", since.Format(time.RFC3339Nano))

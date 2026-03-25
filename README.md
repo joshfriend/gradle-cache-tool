@@ -1,6 +1,6 @@
 # gradle-cache
 
-A CLI tool for saving and restoring Gradle build cache bundles from S3.
+A CLI tool for saving and restoring Gradle build cache bundles, with a ready-to-use GitHub Action.
 
 Bundles are stored keyed by commit SHA, so `restore` doesn't need to know
 exactly which commit produced a given bundle. Instead, it walks the local git
@@ -12,6 +12,69 @@ main-branch commit that has one, without needing to know its SHA in advance.
 The history walk counts distinct author-change boundaries rather than raw
 commit count, so a long run of commits by the same author only consumes one
 step of the search budget. The default search depth is 20 such boundaries.
+
+## GitHub Action
+
+The easiest way to use gradle-cache in CI is with the GitHub Action. It stores
+cache bundles in the GitHub Actions cache (no S3 required) and handles
+restore/save automatically. Place the action **before** your Gradle build step:
+
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history needed for cache lookup
+
+      - uses: joshfriend/gradle-cache-tool@v1  # restores cache here
+
+      - run: ./gradlew assembleDebug            # your build
+
+      # cache is saved automatically when the job finishes
+```
+
+> **Note:** `fetch-depth: 0` is required so the git history walk can search
+> past commits for cache bundles. Without it, GitHub's default shallow clone
+> (depth 1) means only the current commit is checked.
+
+The action has three phases that run at different points in the job lifecycle:
+
+1. **Pre-step** (before your workflow steps) — installs the `gradle-cache` binary
+2. **Main step** (where you place `uses:`) — restores the most recent cache bundle
+3. **Post-step** (automatic, after all steps finish) — saves an updated cache bundle
+
+The post-step runs automatically during job cleanup — you don't need to add a
+separate save step. It runs even if your build fails, so partial caches are
+still preserved for the next run.
+
+On **pull requests**, the action automatically uses delta caches: it restores
+the base bundle from the default branch, applies any existing branch delta on
+top, and after the build only saves the files that changed. On **pushes to
+the default branch**, it saves a full bundle. This is all auto-detected from
+the GitHub event context — no configuration needed.
+
+### Inputs
+
+| Input | Default | Description |
+|-------|---------|-------------|
+| `cache-key` | `github.job` | Cache key identifying the bundle. Each job gets its own cache by default. |
+| `ref` | repo default branch | Git ref for the history walk when searching for a base bundle. |
+| `branch` | auto-detected on PRs | Branch name for delta cache support. |
+| `project-dir` | `.` | Path to the Gradle project root. |
+| `gradle-user-home` | `~/.gradle` | Path to GRADLE_USER_HOME. |
+| `included-build` | | Comma-separated included build paths (e.g. `buildSrc,build-logic`). |
+| `bucket` | | S3 bucket name. When set, uses S3 instead of the GitHub Actions cache. |
+| `region` | `us-west-2` | AWS region (only used with `bucket`). |
+| `save` | `true` | Set to `false` to skip saving after the build. |
+| `version` | `latest` | Version of gradle-cache to install. |
+| `log-level` | `info` | Log level: `debug`, `info`, `warn`, or `error`. |
+
+## CLI
+
+The action wraps the `gradle-cache` CLI, which can also be used standalone
+with S3 or a cachew server as the storage backend.
 
 ## Installation
 

@@ -86,11 +86,28 @@ func copyDir(dst, src string) error {
 	})
 }
 
+// backendArgs returns the CLI flags for the storage backend under test.
+// Set GRADLE_CACHE_BACKEND=github-actions to test against the real GitHub
+// Actions cache (requires ACTIONS_CACHE_URL and ACTIONS_RUNTIME_TOKEN).
+// Otherwise a local fake cachew server is started.
+func backendArgs(t *testing.T) (args []string, cleanup func()) {
+	t.Helper()
+	if os.Getenv("GRADLE_CACHE_BACKEND") == "github-actions" {
+		if os.Getenv("ACTIONS_CACHE_URL") == "" || os.Getenv("ACTIONS_RUNTIME_TOKEN") == "" {
+			t.Skip("ACTIONS_CACHE_URL / ACTIONS_RUNTIME_TOKEN not set")
+		}
+		return []string{"--github-actions"}, func() {}
+	}
+	server := httptest.NewServer(newFakeCachew(t.TempDir()))
+	return []string{"--cachew-url", server.URL}, func() { server.Close() }
+}
+
 // TestIntegrationGradleBuildCycle exercises the full save/restore cycle using
 // the compiled CLI binary as a subprocess. This tests the complete code path
 // including kong CLI parsing, metrics binding, and backend communication.
 //
-// A fake cachew HTTP server stands in for real storage.
+// A fake cachew HTTP server stands in for real storage (or the real GitHub
+// Actions cache when GRADLE_CACHE_BACKEND=github-actions).
 //
 // Requirements: Java on PATH, internet access (first run downloads Gradle wrapper).
 // Skipped automatically if Java is not available or in -short mode.
@@ -98,7 +115,7 @@ func TestIntegrationGradleBuildCycle(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
-	for _, tool := range []string{"java", "zstd", "tar"} {
+	for _, tool := range []string{"java", "tar"} {
 		if _, err := exec.LookPath(tool); err != nil {
 			t.Skipf("%s not available", tool)
 		}
@@ -112,11 +129,99 @@ func TestIntegrationGradleBuildCycle(t *testing.T) {
 		t.Fatalf("go build failed: %v\n%s", err, out)
 	}
 
-	// ── Start fake cachew server ─────────────────────────────────────────────
-	server := httptest.NewServer(newFakeCachew(t.TempDir()))
-	defer server.Close()
+	// ── Backend selection ────────────────────────────────────────────────────
+	backend, cleanupBackend := backendArgs(t)
+	defer cleanupBackend()
 
-	// ── Copy the fixture project ─────────────────────────────────────────────
+	ctx := integrationContext(t)
+
+	// ── Build + Save ─────────────────────────────────────────────────────────
+	t.Log("Step 1: Building and saving cache...")
+	runGradleBuild(t, ctx)
+
+	commitSHA := gitRevParse(t, ctx.projectDir)
+
+	saveArgs := append([]string{"--log-level", "debug", "save"}, backend...)
+	saveArgs = append(saveArgs,
+		"--cache-key", ctx.cacheKey,
+		"--commit", commitSHA,
+		"--gradle-user-home", ctx.gradleUserHome,
+	)
+	runCLI(t, binaryPath, ctx, saveArgs...)
+
+	// ── Clear + Restore + Verify ─────────────────────────────────────────────
+	t.Log("Step 2: Clearing state...")
+	clearGradleState(t, ctx)
+
+	t.Log("Step 3: Restoring cache...")
+	restoreArgs := append([]string{"--log-level", "debug", "restore"}, backend...)
+	restoreArgs = append(restoreArgs,
+		"--cache-key", ctx.cacheKey,
+		"--ref", commitSHA,
+		"--git-dir", ctx.projectDir,
+		"--gradle-user-home", ctx.gradleUserHome,
+	)
+	runCLI(t, binaryPath, ctx, restoreArgs...)
+
+	t.Log("Step 4: Verifying restore...")
+	verifyRestore(t, ctx)
+}
+
+// TestIntegrationGradleBuild runs only the Gradle build step against the
+// fixture project. Use this from CI when the GitHub Action handles
+// restore/save and the test only needs to populate GRADLE_USER_HOME.
+//
+// Set GRADLE_USER_HOME and INTEGRATION_PROJECT_DIR to point at the
+// pre-configured project directory.
+func TestIntegrationGradleBuild(t *testing.T) {
+	if os.Getenv("INTEGRATION_PROJECT_DIR") == "" {
+		t.Skip("INTEGRATION_PROJECT_DIR not set")
+	}
+	for _, tool := range []string{"java", "tar"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s not available", tool)
+		}
+	}
+
+	ctx := externalContext(t)
+	runGradleBuild(t, ctx)
+}
+
+// TestIntegrationVerifyRestore verifies that a previously restored cache
+// produces cache hits on rebuild. Use this from CI when the GitHub Action
+// has already restored GRADLE_USER_HOME.
+//
+// Set GRADLE_USER_HOME and INTEGRATION_PROJECT_DIR to point at the
+// pre-configured project directory.
+func TestIntegrationVerifyRestore(t *testing.T) {
+	if os.Getenv("INTEGRATION_PROJECT_DIR") == "" {
+		t.Skip("INTEGRATION_PROJECT_DIR not set")
+	}
+	for _, tool := range []string{"java", "tar"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s not available", tool)
+		}
+	}
+
+	ctx := externalContext(t)
+	verifyRestore(t, ctx)
+}
+
+// ─── Shared integration helpers ─────────────────────────────────────────────
+
+// integrationCtx holds paths and settings shared across integration test steps.
+type integrationCtx struct {
+	projectDir     string
+	gradleUserHome string
+	gradlew        string
+	cacheKey       string
+}
+
+// integrationContext sets up a fresh fixture project + gradle home for a
+// self-contained integration test.
+func integrationContext(t *testing.T) integrationCtx {
+	t.Helper()
+
 	fixtureDir := filepath.Join("testdata", "gradle-project")
 	if _, err := os.Stat(fixtureDir); err != nil {
 		t.Fatalf("fixture not found: %v", err)
@@ -133,24 +238,63 @@ func TestIntegrationGradleBuildCycle(t *testing.T) {
 	gradlew := filepath.Join(projectDir, "gradlew")
 	must(t, os.Chmod(gradlew, 0o755))
 
-	cacheKey := "cache-test:build"
+	// Initialize git repo so save can resolve HEAD.
+	gitInit(t, projectDir)
 
-	// Helper to run the gradle-cache CLI.
-	runTool := func(args ...string) string {
-		t.Helper()
-		cmd := exec.Command(binaryPath, args...)
-		cmd.Dir = projectDir
-		cmd.Env = gradleEnv(gradleUserHome)
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("gradle-cache %v: %v\n%s", args, err, out)
-		}
-		return string(out)
+	return integrationCtx{
+		projectDir:     projectDir,
+		gradleUserHome: gradleUserHome,
+		gradlew:        gradlew,
+		cacheKey:       "cache-test:build",
+	}
+}
+
+// externalContext builds an integrationCtx from environment variables,
+// for use when the GitHub Action manages the project and gradle home.
+func externalContext(t *testing.T) integrationCtx {
+	t.Helper()
+
+	projectDir := os.Getenv("INTEGRATION_PROJECT_DIR")
+	if projectDir == "" {
+		t.Fatal("INTEGRATION_PROJECT_DIR must be set")
 	}
 
-	// ── Initialize git repo ──────────────────────────────────────────────────
-	gitRun := func(args ...string) string {
-		t.Helper()
+	gradleUserHome := os.Getenv("GRADLE_USER_HOME")
+	if gradleUserHome == "" {
+		home, err := os.UserHomeDir()
+		must(t, err)
+		gradleUserHome = filepath.Join(home, ".gradle")
+	}
+
+	gradlew := filepath.Join(projectDir, "gradlew")
+
+	return integrationCtx{
+		projectDir:     projectDir,
+		gradleUserHome: gradleUserHome,
+		gradlew:        gradlew,
+		cacheKey:       "cache-test:build",
+	}
+}
+
+func runCLI(t *testing.T, binaryPath string, ctx integrationCtx, args ...string) string {
+	t.Helper()
+	cmd := exec.Command(binaryPath, args...)
+	cmd.Dir = ctx.projectDir
+	cmd.Env = gradleEnv(ctx.gradleUserHome)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("gradle-cache %v: %v\n%s", args, err, out)
+	}
+	return string(out)
+}
+
+func gitInit(t *testing.T, projectDir string) {
+	t.Helper()
+	for _, args := range [][]string{
+		{"init"},
+		{"add", "."},
+		{"commit", "-m", "initial"},
+	} {
 		cmd := exec.Command("git", append([]string{"-C", projectDir}, args...)...)
 		cmd.Env = append(os.Environ(),
 			"GIT_AUTHOR_NAME=Test",
@@ -158,78 +302,64 @@ func TestIntegrationGradleBuildCycle(t *testing.T) {
 			"GIT_COMMITTER_NAME=Test",
 			"GIT_COMMITTER_EMAIL=test@test.com",
 		)
-		out, err := cmd.CombinedOutput()
-		if err != nil {
+		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v\n%s", args, err, out)
 		}
-		return strings.TrimSpace(string(out))
 	}
+}
 
-	gitRun("init")
-	gitRun("add", ".")
-	gitRun("commit", "-m", "initial")
-	commitSHA := gitRun("rev-parse", "HEAD")
+func gitRevParse(t *testing.T, projectDir string) string {
+	t.Helper()
+	cmd := exec.Command("git", "-C", projectDir, "rev-parse", "HEAD")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git rev-parse: %v\n%s", err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
 
-	// ── Step 1: Initial Gradle build ─────────────────────────────────────────
-	t.Log("Step 1: Running initial Gradle build...")
-	gradleRun(t, projectDir, gradlew, gradleUserHome, "build")
+func runGradleBuild(t *testing.T, ctx integrationCtx) {
+	t.Helper()
+	gradleRun(t, ctx.projectDir, ctx.gradlew, ctx.gradleUserHome, "build")
 
-	classesDir := filepath.Join(projectDir, "build", "classes")
+	classesDir := filepath.Join(ctx.projectDir, "build", "classes")
 	if _, err := os.Stat(classesDir); err != nil {
 		t.Fatalf("expected compiled classes: %v", err)
 	}
+}
 
-	// ── Step 2: Save the cache via CLI ───────────────────────────────────────
-	t.Log("Step 2: Saving cache via CLI...")
-	runTool("--log-level", "debug", "save",
-		"--cachew-url", server.URL,
-		"--cache-key", cacheKey,
-		"--commit", commitSHA,
-		"--gradle-user-home", gradleUserHome,
-	)
+func clearGradleState(t *testing.T, ctx integrationCtx) {
+	t.Helper()
+	must(t, os.RemoveAll(ctx.gradleUserHome))
+	must(t, os.MkdirAll(ctx.gradleUserHome, 0o755))
+	must(t, os.RemoveAll(filepath.Join(ctx.projectDir, ".gradle")))
+	must(t, os.RemoveAll(filepath.Join(ctx.projectDir, "build")))
 
-	// ── Step 3: Clear all Gradle state ───────────────────────────────────────
-	t.Log("Step 3: Clearing Gradle state...")
-	must(t, os.RemoveAll(gradleUserHome))
-	must(t, os.MkdirAll(gradleUserHome, 0o755))
-	must(t, os.RemoveAll(filepath.Join(projectDir, ".gradle")))
-	must(t, os.RemoveAll(filepath.Join(projectDir, "build")))
-
-	if _, err := os.Stat(filepath.Join(gradleUserHome, "caches")); err == nil {
+	if _, err := os.Stat(filepath.Join(ctx.gradleUserHome, "caches")); err == nil {
 		t.Fatal("expected caches dir to be gone after cleanup")
 	}
+}
 
-	// ── Step 4: Restore the cache via CLI ────────────────────────────────────
-	t.Log("Step 4: Restoring cache via CLI...")
-	runTool("--log-level", "debug", "restore",
-		"--cachew-url", server.URL,
-		"--cache-key", cacheKey,
-		"--ref", commitSHA,
-		"--git-dir", projectDir,
-		"--gradle-user-home", gradleUserHome,
-	)
+func verifyRestore(t *testing.T, ctx integrationCtx) {
+	t.Helper()
 
-	if _, err := os.Stat(filepath.Join(gradleUserHome, "caches")); err != nil {
+	if _, err := os.Stat(filepath.Join(ctx.gradleUserHome, "caches")); err != nil {
 		t.Fatalf("expected caches dir after restore: %v", err)
 	}
 
-	if _, err := os.Stat(filepath.Join(gradleUserHome, "wrapper")); err != nil {
+	if _, err := os.Stat(filepath.Join(ctx.gradleUserHome, "wrapper")); err != nil {
 		t.Fatalf("expected wrapper dir after restore: %v", err)
 	}
 
-	ccRestored := filepath.Join(projectDir, ".gradle", "configuration-cache")
+	ccRestored := filepath.Join(ctx.projectDir, ".gradle", "configuration-cache")
 	if _, err := os.Stat(ccRestored); err != nil {
 		t.Log("  configuration-cache dir was NOT restored")
 	} else {
 		t.Log("  configuration-cache dir restored")
 	}
 
-	// ── Step 5: Rebuild and verify cache hits ────────────────────────────────
-	t.Log("Step 5: Rebuilding to verify cache hits...")
-	output := gradleRun(t, projectDir, gradlew, gradleUserHome, "build")
+	output := gradleRun(t, ctx.projectDir, ctx.gradlew, ctx.gradleUserHome, "build")
 
-	// Verify the wrapper was NOT re-downloaded — if it was, the bundle didn't
-	// include the wrapper directory (or the .ok marker file was missing).
 	if strings.Contains(output, "Downloading") {
 		t.Error("Gradle re-downloaded the wrapper distribution after restore; wrapper/ should be cached in the bundle")
 	}
@@ -252,7 +382,7 @@ func TestIntegrationGradleBuildCycle(t *testing.T) {
 		t.Error("expected at least some tasks to be FROM-CACHE or UP-TO-DATE after restore")
 	}
 
-	t.Log("Integration test passed")
+	t.Log("Verify restore passed")
 }
 
 // gradleRun executes a Gradle build and returns the combined output.

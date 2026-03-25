@@ -15,9 +15,6 @@ jobs:
       - name: Activate Hermit
         run: echo "${GITHUB_WORKSPACE}/bin" >> "$GITHUB_PATH"
 
-      - name: Install system dependencies
-        run: sudo apt-get install -y zstd
-
       - uses: actions/setup-java@v4
         with:
           distribution: temurin

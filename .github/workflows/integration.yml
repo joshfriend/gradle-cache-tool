@@ -1,0 +1,152 @@
+name: Integration Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Job 1: Cache miss → build Gradle → save full bundle.
+  save-full:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Activate Hermit
+        run: echo "${GITHUB_WORKSPACE}/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 25
+
+      - name: Build gradle-cache from source
+        run: |
+          go build -o gradle-cache ./cmd/gradle-cache
+          echo "$PWD" >> "$GITHUB_PATH"
+
+      - name: Prepare test project
+        run: |
+          cp -r cmd/gradle-cache/testdata/gradle-project "$RUNNER_TEMP/project"
+          chmod +x "$RUNNER_TEMP/project/gradlew"
+
+      - uses: ./
+        with:
+          cache-key: integration-test
+          project-dir: ${{ runner.temp }}/project
+          gradle-user-home: ${{ runner.temp }}/gradle-home
+          ref: HEAD
+          log-level: debug
+
+      - name: Run Gradle build
+        run: go test -v -run ^TestIntegrationGradleBuild$ -timeout 300s ./cmd/gradle-cache/
+        env:
+          INTEGRATION_PROJECT_DIR: ${{ runner.temp }}/project
+          GRADLE_USER_HOME: ${{ runner.temp }}/gradle-home
+
+      # Post step saves a full bundle automatically.
+
+  # Job 2: Restore full bundle (hit) → verify cache hits → save delta.
+  verify-full-and-save-delta:
+    needs: save-full
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Activate Hermit
+        run: echo "${GITHUB_WORKSPACE}/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 25
+
+      - name: Build gradle-cache from source
+        run: |
+          go build -o gradle-cache ./cmd/gradle-cache
+          echo "$PWD" >> "$GITHUB_PATH"
+
+      - name: Prepare test project
+        run: |
+          cp -r cmd/gradle-cache/testdata/gradle-project "$RUNNER_TEMP/project"
+          chmod +x "$RUNNER_TEMP/project/gradlew"
+
+      # Restore the full bundle, then verify it.
+      - uses: ./
+        with:
+          cache-key: integration-test
+          project-dir: ${{ runner.temp }}/project
+          gradle-user-home: ${{ runner.temp }}/gradle-home
+          branch: integration-delta-test
+          ref: HEAD
+          log-level: debug
+
+      - name: Verify full restore
+        run: go test -v -run ^TestIntegrationVerifyRestore$ -timeout 300s ./cmd/gradle-cache/
+        env:
+          INTEGRATION_PROJECT_DIR: ${{ runner.temp }}/project
+          GRADLE_USER_HOME: ${{ runner.temp }}/gradle-home
+
+      # Modify build.gradle to invalidate the configuration cache, then
+      # rebuild so the delta captures the regenerated config cache entry.
+      - name: Modify build.gradle and rebuild
+        run: |
+          echo '// delta change' >> "$RUNNER_TEMP/project/build.gradle"
+          cd "$RUNNER_TEMP/project"
+          GRADLE_USER_HOME="${{ runner.temp }}/gradle-home" ./gradlew build
+
+      # Post step saves a delta bundle for branch "integration-delta-test".
+
+  # Job 3: Restore full bundle + delta → verify cache hits.
+  verify-delta:
+    needs: verify-full-and-save-delta
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Activate Hermit
+        run: echo "${GITHUB_WORKSPACE}/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 25
+
+      - name: Build gradle-cache from source
+        run: |
+          go build -o gradle-cache ./cmd/gradle-cache
+          echo "$PWD" >> "$GITHUB_PATH"
+
+      - name: Prepare test project
+        run: |
+          cp -r cmd/gradle-cache/testdata/gradle-project "$RUNNER_TEMP/project"
+          chmod +x "$RUNNER_TEMP/project/gradlew"
+
+      # Restore full + delta bundle concurrently.
+      - uses: ./
+        with:
+          cache-key: integration-test
+          project-dir: ${{ runner.temp }}/project
+          gradle-user-home: ${{ runner.temp }}/gradle-home
+          branch: integration-delta-test
+          save: "false"
+          ref: HEAD
+          log-level: debug
+
+      - name: Verify delta restore
+        run: go test -v -run ^TestIntegrationVerifyRestore$ -timeout 300s ./cmd/gradle-cache/
+        env:
+          INTEGRATION_PROJECT_DIR: ${{ runner.temp }}/project
+          GRADLE_USER_HOME: ${{ runner.temp }}/gradle-home

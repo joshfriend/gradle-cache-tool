@@ -1,0 +1,19 @@
+{
+  "name": "gradle-cache-action",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "build": "npm run build:pre && npm run build:main && npm run build:post",
+    "build:pre": "ncc build src/pre.js -o ../dist/pre",
+    "build:main": "ncc build src/main.js -o ../dist/main",
+    "build:post": "ncc build src/post.js -o ../dist/post"
+  },
+  "dependencies": {
+    "@actions/core": "^1.10.1",
+    "@actions/exec": "^1.1.1",
+    "@actions/tool-cache": "^2.0.1"
+  },
+  "devDependencies": {
+    "@vercel/ncc": "^0.38.1"
+  }
+}

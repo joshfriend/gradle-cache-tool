@@ -1,0 +1,38 @@
+name: Update Major Version Tag
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  update-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update major version tag
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+
+          # Extract major version (v1.2.3 → v1)
+          MAJOR=$(echo "$TAG" | grep -oE '^v[0-9]+')
+
+          if [ -z "$MAJOR" ]; then
+            echo "Tag $TAG doesn't match vX.Y.Z pattern, skipping"
+            exit 0
+          fi
+
+          # Skip pre-release versions (v0.x.x)
+          if [ "$MAJOR" = "v0" ]; then
+            echo "Pre-release tag $TAG, skipping major tag update"
+            exit 0
+          fi
+
+          echo "Moving $MAJOR tag to $TAG"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -fa "$MAJOR" -m "$MAJOR → $TAG"
+          git push origin "$MAJOR" --force

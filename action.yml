@@ -1,0 +1,72 @@
+name: Gradle Cache
+description: >
+  Save and restore Gradle build caches using gradle-cache-tool.
+  Restores a cache bundle before the build and automatically saves it afterward.
+  Uses the GitHub Actions cache by default — no S3 setup required.
+author: joshfriend
+branding:
+  icon: archive
+  color: green
+
+inputs:
+  cache-key:
+    description: >
+      Cache key identifying the bundle (e.g. "assembleDebug"). Defaults to the
+      job name so each job gets its own cache automatically.
+    required: false
+    default: ${{ github.job }}
+  bucket:
+    description: >
+      S3 bucket name. When set, uses S3 instead of the GitHub Actions cache.
+    required: false
+  region:
+    description: AWS region for the S3 bucket.
+    required: false
+    default: us-west-2
+  ref:
+    description: >
+      Git ref to start the history walk from when searching for a base bundle.
+      Defaults to the repository's default branch.
+    required: false
+  branch:
+    description: >
+      Branch name for delta cache support. On pull_request events this is
+      auto-detected from GITHUB_HEAD_REF, so you typically don't need to set
+      it. When active, restore applies a branch delta concurrently with the
+      base bundle, and save-delta runs in the post step instead of a full save.
+      On pushes to the default branch, a full bundle is saved automatically.
+    required: false
+  project-dir:
+    description: >
+      Path to the Gradle project root. Used for the git history walk and as
+      the working directory for save/restore. Defaults to the repository root.
+    required: false
+    default: .
+  gradle-user-home:
+    description: Path to GRADLE_USER_HOME.
+    required: false
+    default: ~/.gradle
+  included-build:
+    description: >
+      Comma-separated list of included build paths to archive
+      (e.g. "buildSrc,build-logic"). Defaults to buildSrc.
+    required: false
+  save:
+    description: Whether to save the cache after the build. Set to "false" to skip.
+    required: false
+    default: "true"
+  version:
+    description: >
+      Version of gradle-cache to install (e.g. "v0.3.0"). Defaults to latest.
+    required: false
+  log-level:
+    description: "Log level: debug, info, warn, or error."
+    required: false
+    default: info
+
+runs:
+  using: node24
+  pre: dist/pre/index.js
+  main: dist/main/index.js
+  post: dist/post/index.js
+  post-if: always()
