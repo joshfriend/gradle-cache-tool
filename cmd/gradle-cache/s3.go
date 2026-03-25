@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/alecthomas/errors"
+	"golang.org/x/sync/errgroup"
 )
 
 // awsCreds holds AWS credentials (permanent or temporary session credentials).
@@ -135,11 +136,28 @@ func (c *s3Client) get(ctx context.Context, bucket, key string, info s3ObjInfo) 
 
 	// Large object: parallel range requests, reassembled in order and piped to
 	// the caller so download and extraction run concurrently.
+	// Use a cancellable context so workers stop promptly if the consumer
+	// disconnects or a chunk fails.
+	dlCtx, cancel := context.WithCancel(ctx)
 	pr, pw := io.Pipe()
 	go func() {
-		pw.CloseWithError(c.parallelGet(ctx, bucket, key, info, pw))
+		err := c.parallelGet(dlCtx, bucket, key, info, pw)
+		cancel()
+		pw.CloseWithError(err)
 	}()
-	return pr, nil
+	return &cancelReadCloser{ReadCloser: pr, cancel: cancel}, nil
+}
+
+// cancelReadCloser wraps an io.ReadCloser and cancels a context on Close,
+// ensuring background goroutines are cleaned up when the consumer is done.
+type cancelReadCloser struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (c *cancelReadCloser) Close() error {
+	c.cancel()
+	return c.ReadCloser.Close()
 }
 
 // parallelGet downloads the object in parallel chunks and writes them in order
@@ -149,7 +167,7 @@ func (c *s3Client) get(ctx context.Context, bucket, key string, info s3ObjInfo) 
 // All range requests are pinned to the given ETag to ensure consistency.
 func (c *s3Client) parallelGet(ctx context.Context, bucket, key string, info s3ObjInfo, w io.Writer) error {
 	numChunks := int((info.Size + c.chunkSize - 1) / c.chunkSize)
-	numWorkers := c.dlWorkers
+	numWorkers := min(c.dlWorkers, numChunks)
 
 	type chunkResult struct {
 		data []byte
@@ -170,16 +188,19 @@ func (c *s3Client) parallelGet(ctx context.Context, bucket, key string, info s3O
 	}
 	close(work)
 
-	var wg sync.WaitGroup
-	for range min(numWorkers, numChunks) {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	eg, egCtx := errgroup.WithContext(ctx)
+	for range numWorkers {
+		eg.Go(func() error {
 			for seq := range work {
+				if egCtx.Err() != nil {
+					results[seq] <- chunkResult{err: egCtx.Err()}
+					continue
+				}
+
 				start := int64(seq) * c.chunkSize
 				end := min(start+c.chunkSize-1, info.Size-1)
 
-				req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.objectURL(bucket, key), nil)
+				req, err := http.NewRequestWithContext(egCtx, http.MethodGet, c.objectURL(bucket, key), nil)
 				if err != nil {
 					results[seq] <- chunkResult{err: err}
 					continue
@@ -210,28 +231,38 @@ func (c *s3Client) parallelGet(ctx context.Context, bucket, key string, info s3O
 				resp.Body.Close() //nolint:errcheck,gosec
 				results[seq] <- chunkResult{data: data, err: readErr}
 			}
-		}()
+			return nil
+		})
 	}
 
-	// Write chunks to w in order. Each receive blocks until that chunk's
-	// worker has drained its body, while other workers continue concurrently.
+	// Write chunks to w in order in a separate goroutine so we can return
+	// eg.Wait() which blocks until all workers finish.
 	var writeErr error
-	for _, ch := range results {
-		r := <-ch
-		if writeErr != nil {
-			continue // drain remaining channels so goroutines can exit
+	writeDone := make(chan struct{})
+	go func() {
+		defer close(writeDone)
+		for _, ch := range results {
+			r := <-ch
+			if writeErr != nil {
+				continue // drain remaining channels so goroutines can exit
+			}
+			if r.err != nil {
+				writeErr = r.err
+				continue
+			}
+			if _, err := w.Write(r.data); err != nil {
+				writeErr = err
+			}
 		}
-		if r.err != nil {
-			writeErr = r.err
-			continue
-		}
-		if _, err := w.Write(r.data); err != nil {
-			writeErr = err
-		}
-	}
+	}()
 
-	wg.Wait()
-	return writeErr
+	egErr := eg.Wait()
+	<-writeDone
+
+	if writeErr != nil {
+		return writeErr
+	}
+	return egErr
 }
 
 const (
