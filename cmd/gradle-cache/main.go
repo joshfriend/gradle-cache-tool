@@ -60,9 +60,17 @@ type backendFlags struct {
 }
 
 // bundleStore abstracts over S3 and cachew as storage backends for Gradle cache bundles.
+// bundleStatInfo holds opaque metadata returned by bundleStore.stat() that
+// must be forwarded to get(). For S3 it carries the ETag used to pin parallel
+// range-GET requests to one object revision; other backends may leave it empty.
+type bundleStatInfo struct {
+	Size int64
+	etag string // S3-only: pins range-GET requests to a single object revision
+}
+
 type bundleStore interface {
-	stat(ctx context.Context, commit, cacheKey string) (int64, error)
-	get(ctx context.Context, commit, cacheKey string, size int64) (io.ReadCloser, error)
+	stat(ctx context.Context, commit, cacheKey string) (bundleStatInfo, error)
+	get(ctx context.Context, commit, cacheKey string, info bundleStatInfo) (io.ReadCloser, error)
 	put(ctx context.Context, commit, cacheKey string, r io.ReadSeeker, size int64) error
 	// putStream uploads from an io.Reader of unknown size, enabling streaming
 	// archive-to-upload pipelines. Returns the total bytes uploaded.
@@ -76,12 +84,16 @@ type s3BundleStore struct {
 	bucket string
 }
 
-func (s *s3BundleStore) stat(ctx context.Context, commit, cacheKey string) (int64, error) {
-	return s.client.stat(ctx, s.bucket, s3Key(commit, cacheKey, bundleFilename(cacheKey)))
+func (s *s3BundleStore) stat(ctx context.Context, commit, cacheKey string) (bundleStatInfo, error) {
+	obj, err := s.client.stat(ctx, s.bucket, s3Key(commit, cacheKey, bundleFilename(cacheKey)))
+	if err != nil {
+		return bundleStatInfo{}, err
+	}
+	return bundleStatInfo{Size: obj.Size, etag: obj.ETag}, nil
 }
 
-func (s *s3BundleStore) get(ctx context.Context, commit, cacheKey string, size int64) (io.ReadCloser, error) {
-	return s.client.get(ctx, s.bucket, s3Key(commit, cacheKey, bundleFilename(cacheKey)), size)
+func (s *s3BundleStore) get(ctx context.Context, commit, cacheKey string, info bundleStatInfo) (io.ReadCloser, error) {
+	return s.client.get(ctx, s.bucket, s3Key(commit, cacheKey, bundleFilename(cacheKey)), s3ObjInfo{Size: info.Size, ETag: info.etag})
 }
 
 func (s *s3BundleStore) put(ctx context.Context, commit, cacheKey string, r io.ReadSeeker, size int64) error {
@@ -184,11 +196,11 @@ func (c *RestoreCmd) Run(ctx context.Context, metrics metricsClient) error {
 	}
 
 	var hitCommit string
-	var hitSize int64
+	var hitInfo bundleStatInfo
 	for _, sha := range commits {
-		if size, err := store.stat(ctx, sha, c.CacheKey); err == nil {
+		if info, err := store.stat(ctx, sha, c.CacheKey); err == nil {
 			hitCommit = sha
-			hitSize = size
+			hitInfo = info
 			break
 		}
 		slog.Debug("cache miss", "sha", sha[:min(8, len(sha))])
@@ -219,7 +231,7 @@ func (c *RestoreCmd) Run(ctx context.Context, metrics metricsClient) error {
 		deltaCh = make(chan deltaResult, 1)
 		go func() {
 			dc := deltaCommit(c.Branch)
-			_, statErr := store.stat(ctx, dc, c.CacheKey)
+			deltaInfo, statErr := store.stat(ctx, dc, c.CacheKey)
 			if statErr != nil {
 				slog.Info("no delta bundle found for branch", "branch", c.Branch)
 				deltaCh <- deltaResult{} // empty result; nil tmpFile signals "no delta"
@@ -227,7 +239,7 @@ func (c *RestoreCmd) Run(ctx context.Context, metrics metricsClient) error {
 			}
 			slog.Info("found delta bundle, downloading in background", "branch", c.Branch)
 			dlStart := time.Now()
-			body, err := store.get(ctx, dc, c.CacheKey, 0)
+			body, err := store.get(ctx, dc, c.CacheKey, deltaInfo)
 			if err != nil {
 				deltaCh <- deltaResult{err: errors.Wrap(err, "get delta bundle")}
 				return
@@ -292,7 +304,7 @@ func (c *RestoreCmd) Run(ctx context.Context, metrics metricsClient) error {
 		{prefix: "configuration-cache/", baseDir: filepath.Join(projectDir, ".gradle")},
 	}
 
-	body, err := store.get(ctx, hitCommit, c.CacheKey, hitSize)
+	body, err := store.get(ctx, hitCommit, c.CacheKey, hitInfo)
 	if err != nil {
 		return errors.Wrap(err, "get bundle")
 	}
@@ -449,7 +461,7 @@ func (c *RestoreDeltaCmd) Run(ctx context.Context, metrics metricsClient) error 
 	}
 
 	dc := deltaCommit(c.Branch)
-	size, err := store.stat(ctx, dc, c.CacheKey)
+	deltaInfo, err := store.stat(ctx, dc, c.CacheKey)
 	if err != nil {
 		slog.Info("no delta bundle found for branch", "branch", c.Branch, "cache-key", c.CacheKey)
 		return nil
@@ -457,7 +469,7 @@ func (c *RestoreDeltaCmd) Run(ctx context.Context, metrics metricsClient) error 
 	slog.Info("found delta bundle", "branch", c.Branch, "cache-key", c.CacheKey)
 
 	dlStart := time.Now()
-	body, err := store.get(ctx, dc, c.CacheKey, size)
+	body, err := store.get(ctx, dc, c.CacheKey, deltaInfo)
 	if err != nil {
 		return errors.Wrap(err, "get delta bundle")
 	}
@@ -539,7 +551,7 @@ func (c *SaveCmd) Run(ctx context.Context, metrics metricsClient) error {
 	}
 
 	// Skip upload if bundle already exists.
-	if _, err := store.stat(ctx, c.Commit, c.CacheKey); err == nil {
+	if _, err = store.stat(ctx, c.Commit, c.CacheKey); err == nil {
 		slog.Info("bundle already exists", "commit", c.Commit[:min(8, len(c.Commit))], "cache-key", c.CacheKey)
 		return nil
 	}

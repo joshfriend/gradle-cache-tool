@@ -36,27 +36,27 @@ func (c *cachewClient) objectURL(commit, cacheKey string) string {
 // stat returns (0, nil) when the bundle exists. Size is not used by this
 // backend since cachew does not expose Content-Length on HEAD and parallel
 // range downloads are handled server-side.
-func (c *cachewClient) stat(ctx context.Context, commit, cacheKey string) (int64, error) {
+func (c *cachewClient) stat(ctx context.Context, commit, cacheKey string) (bundleStatInfo, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, c.objectURL(commit, cacheKey), nil)
 	if err != nil {
-		return 0, err
+		return bundleStatInfo{}, err
 	}
 	resp, err := c.http.Do(req) //nolint:gosec
 	if err != nil {
-		return 0, err
+		return bundleStatInfo{}, err
 	}
 	io.Copy(io.Discard, resp.Body) //nolint:errcheck,gosec
 	resp.Body.Close()              //nolint:errcheck,gosec
 	if resp.StatusCode == http.StatusNotFound {
-		return 0, errors.Errorf("cachew: not found for %.8s", commit)
+		return bundleStatInfo{}, errors.Errorf("cachew: not found for %.8s", commit)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return 0, errors.Errorf("cachew HEAD %.8s: status %d", commit, resp.StatusCode)
+		return bundleStatInfo{}, errors.Errorf("cachew HEAD %.8s: status %d", commit, resp.StatusCode)
 	}
-	return 0, nil
+	return bundleStatInfo{}, nil
 }
 
-func (c *cachewClient) get(ctx context.Context, commit, cacheKey string, _ int64) (io.ReadCloser, error) {
+func (c *cachewClient) get(ctx context.Context, commit, cacheKey string, _ bundleStatInfo) (io.ReadCloser, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.objectURL(commit, cacheKey), nil)
 	if err != nil {
 		return nil, err

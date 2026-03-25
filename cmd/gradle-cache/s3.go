@@ -65,24 +65,34 @@ func newS3Client(region string) (*s3Client, error) {
 	}, nil
 }
 
-// stat returns the object size if the object exists, or an error otherwise.
-// The returned size is used by get() to plan chunk ranges without a second HEAD.
-func (c *s3Client) stat(ctx context.Context, bucket, key string) (int64, error) {
+// s3ObjInfo holds metadata returned by a HEAD request.
+type s3ObjInfo struct {
+	Size int64
+	ETag string // used to pin parallel range-GET requests to one revision
+}
+
+// stat returns object metadata if the object exists, or an error otherwise.
+// The returned info is passed to get() so it can plan chunk ranges and pin
+// all range requests to the same object revision via If-Match.
+func (c *s3Client) stat(ctx context.Context, bucket, key string) (s3ObjInfo, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, c.objectURL(bucket, key), nil)
 	if err != nil {
-		return 0, err
+		return s3ObjInfo{}, err
 	}
 	c.sign(req)
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return 0, err
+		return s3ObjInfo{}, err
 	}
 	io.Copy(io.Discard, resp.Body) //nolint:errcheck,gosec
 	resp.Body.Close()              //nolint:errcheck,gosec
 	if resp.StatusCode != http.StatusOK {
-		return 0, errors.Errorf("s3 HEAD %s/%s: status %d", bucket, key, resp.StatusCode)
+		return s3ObjInfo{}, errors.Errorf("s3 HEAD %s/%s: status %d", bucket, key, resp.StatusCode)
 	}
-	return resp.ContentLength, nil
+	return s3ObjInfo{
+		Size: resp.ContentLength,
+		ETag: resp.Header.Get("ETag"),
+	}, nil
 }
 
 const (
@@ -96,14 +106,16 @@ const (
 )
 
 // get downloads an object and returns its body as a streaming ReadCloser.
-// size must come from a prior stat() call — this avoids an extra HEAD round
+// info must come from a prior stat() call — this avoids an extra HEAD round
 // trip. For objects larger than one chunk, parallel Range requests are issued
 // and reassembled in order through an io.Pipe so the caller's pipeline
-// (pzstd → extractor) runs concurrently with the download.
+// (pzstd → extractor) runs concurrently with the download. All range requests
+// are pinned to the ETag from stat() to prevent reading mixed revisions if
+// the key is overwritten during a large download.
 // The caller must close the returned reader.
-func (c *s3Client) get(ctx context.Context, bucket, key string, size int64) (io.ReadCloser, error) {
+func (c *s3Client) get(ctx context.Context, bucket, key string, info s3ObjInfo) (io.ReadCloser, error) {
 	// Small object or unknown size: single-stream GET.
-	if size <= c.chunkSize {
+	if info.Size <= c.chunkSize {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.objectURL(bucket, key), nil)
 		if err != nil {
 			return nil, err
@@ -125,7 +137,7 @@ func (c *s3Client) get(ctx context.Context, bucket, key string, size int64) (io.
 	// the caller so download and extraction run concurrently.
 	pr, pw := io.Pipe()
 	go func() {
-		pw.CloseWithError(c.parallelGet(ctx, bucket, key, size, pw))
+		pw.CloseWithError(c.parallelGet(ctx, bucket, key, info, pw))
 	}()
 	return pr, nil
 }
@@ -134,8 +146,9 @@ func (c *s3Client) get(ctx context.Context, bucket, key string, size int64) (io.
 // to w. Each worker drains its chunk fully into memory so its TCP connection
 // stays active at full speed. All workers run concurrently, saturating the
 // available S3 bandwidth. Peak memory is numWorkers × downloadChunkSize.
-func (c *s3Client) parallelGet(ctx context.Context, bucket, key string, size int64, w io.Writer) error {
-	numChunks := int((size + c.chunkSize - 1) / c.chunkSize)
+// All range requests are pinned to the given ETag to ensure consistency.
+func (c *s3Client) parallelGet(ctx context.Context, bucket, key string, info s3ObjInfo, w io.Writer) error {
+	numChunks := int((info.Size + c.chunkSize - 1) / c.chunkSize)
 	numWorkers := c.dlWorkers
 
 	type chunkResult struct {
@@ -164,7 +177,7 @@ func (c *s3Client) parallelGet(ctx context.Context, bucket, key string, size int
 			defer wg.Done()
 			for seq := range work {
 				start := int64(seq) * c.chunkSize
-				end := min(start+c.chunkSize-1, size-1)
+				end := min(start+c.chunkSize-1, info.Size-1)
 
 				req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.objectURL(bucket, key), nil)
 				if err != nil {
@@ -172,6 +185,11 @@ func (c *s3Client) parallelGet(ctx context.Context, bucket, key string, size int
 					continue
 				}
 				req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+				// Pin to the object revision from stat() to prevent reading a
+				// mix of old and new data if the key is overwritten mid-download.
+				if info.ETag != "" {
+					req.Header.Set("If-Match", info.ETag)
+				}
 				c.sign(req)
 
 				resp, err := c.http.Do(req) //nolint:gosec

@@ -1373,12 +1373,12 @@ func TestS3BundleStoreRoundTrip(t *testing.T) {
 	fs.objects[legacyKey] = payload
 	fs.mu.Unlock()
 
-	_, err := store.stat(ctx, commit, cacheKey)
+	info, err := store.stat(ctx, commit, cacheKey)
 	if err != nil {
 		t.Fatalf("stat: %v", err)
 	}
 
-	r, err := store.get(ctx, commit, cacheKey, int64(len(payload)))
+	r, err := store.get(ctx, commit, cacheKey, info)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
