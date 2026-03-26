@@ -1,5 +1,9 @@
 version: 2
 
+# Use a separate directory so --clean doesn't delete the Action's bundled JS
+# files in dist/{main,post,pre}/.
+dist: .goreleaser-dist
+
 builds:
   - id: gradle-cache
     main: ./cmd/gradle-cache
