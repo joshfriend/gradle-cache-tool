@@ -36,28 +36,36 @@ type writeJob struct {
 }
 
 func extractTarParallelRouted(r io.Reader, targetFn func(string) string, skipExisting bool) error {
+	useIoUring := os.Getenv("GRADLE_CACHE_IOURING") == "1"
+
 	numWorkers := extractWorkerCount()
 	jobs := make(chan writeJob, numWorkers*2)
 
 	g, ctx := errgroup.WithContext(context.Background())
 
-	for range numWorkers {
+	if useIoUring {
 		g.Go(func() error {
-			for job := range jobs {
-				f, err := os.OpenFile(job.target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, job.mode)
-				if err != nil {
-					return errors.Errorf("open %s: %w", filepath.Base(job.target), err)
-				}
-				if _, err := f.Write(job.data); err != nil {
-					f.Close() //nolint:errcheck,gosec
-					return errors.Errorf("write %s: %w", filepath.Base(job.target), err)
-				}
-				if err := f.Close(); err != nil {
-					return errors.Errorf("close %s: %w", filepath.Base(job.target), err)
-				}
-			}
-			return nil
+			return extractTarIoUring(jobs)
 		})
+	} else {
+		for range numWorkers {
+			g.Go(func() error {
+				for job := range jobs {
+					f, err := os.OpenFile(job.target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, job.mode)
+					if err != nil {
+						return errors.Errorf("open %s: %w", filepath.Base(job.target), err)
+					}
+					if _, err := f.Write(job.data); err != nil {
+						f.Close() //nolint:errcheck,gosec
+						return errors.Errorf("write %s: %w", filepath.Base(job.target), err)
+					}
+					if err := f.Close(); err != nil {
+						return errors.Errorf("close %s: %w", filepath.Base(job.target), err)
+					}
+				}
+				return nil
+			})
+		}
 	}
 
 	copyBuf := make([]byte, 1<<20)
