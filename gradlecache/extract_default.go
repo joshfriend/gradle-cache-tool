@@ -13,8 +13,6 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-const maxParallelFileSize = 4 << 20
-
 func extractWorkerCount() int {
 	return 16
 }
@@ -60,8 +58,6 @@ func extractTarParallelRouted(r io.Reader, targetFn func(string) string, skipExi
 		})
 	}
 
-	copyBuf := make([]byte, 1<<20)
-
 	createdDirs := make(map[string]struct{})
 	ensureDir := func(d string, mode os.FileMode) error {
 		if _, ok := createdDirs[d]; ok {
@@ -74,7 +70,7 @@ func extractTarParallelRouted(r io.Reader, targetFn func(string) string, skipExi
 		return nil
 	}
 
-	readErr := readTarEntries(r, targetFn, skipExisting, ensureDir, jobs, copyBuf, ctx)
+	readErr := readTarEntries(r, targetFn, skipExisting, ensureDir, jobs, ctx)
 
 	close(jobs)
 	writeErr := g.Wait()
@@ -91,7 +87,6 @@ func readTarEntries(
 	skipExisting bool,
 	ensureDir func(string, os.FileMode) error,
 	jobs chan<- writeJob,
-	copyBuf []byte,
 	ctx context.Context,
 ) error {
 	tr := tar.NewReader(r)
@@ -108,7 +103,7 @@ func readTarEntries(
 			return errors.Wrap(err, "read tar entry")
 		}
 
-		if err := processEntry(tr, hdr, targetFn, skipExisting, ensureDir, jobs, copyBuf); err != nil {
+		if err := processEntry(tr, hdr, targetFn, skipExisting, ensureDir, jobs); err != nil {
 			return err
 		}
 	}
@@ -121,7 +116,6 @@ func processEntry(
 	skipExisting bool,
 	ensureDir func(string, os.FileMode) error,
 	jobs chan<- writeJob,
-	copyBuf []byte,
 ) error {
 	name, err := safeTarEntryName(hdr.Name)
 	if err != nil {
@@ -146,25 +140,11 @@ func processEntry(
 			return errors.Errorf("mkdir %s: %w", hdr.Name, err)
 		}
 
-		if hdr.Size <= maxParallelFileSize {
-			buf := make([]byte, hdr.Size)
-			if _, err := io.ReadFull(tr, buf); err != nil {
-				return errors.Errorf("read %s: %w", hdr.Name, err)
-			}
-			jobs <- writeJob{target: target, mode: hdr.FileInfo().Mode(), data: buf}
-		} else {
-			f, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, hdr.FileInfo().Mode()) //nolint:gosec
-			if err != nil {
-				return errors.Errorf("open %s: %w", hdr.Name, err)
-			}
-			if _, err := io.CopyBuffer(f, io.LimitReader(tr, hdr.Size), copyBuf); err != nil {
-				f.Close() //nolint:errcheck,gosec
-				return errors.Errorf("write %s: %w", hdr.Name, err)
-			}
-			if err := f.Close(); err != nil {
-				return errors.Errorf("close %s: %w", hdr.Name, err)
-			}
+		buf := make([]byte, hdr.Size)
+		if _, err := io.ReadFull(tr, buf); err != nil {
+			return errors.Errorf("read %s: %w", hdr.Name, err)
 		}
+		jobs <- writeJob{target: target, mode: hdr.FileInfo().Mode(), data: buf}
 
 	case tar.TypeSymlink:
 		if skipExisting {

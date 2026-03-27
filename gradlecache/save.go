@@ -15,8 +15,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/DataDog/zstd"
 	"github.com/alecthomas/errors"
-	"github.com/klauspost/compress/zstd"
 )
 
 // RestoreDeltaConfig holds the parameters for a delta restore operation.
@@ -384,12 +384,7 @@ func CreateTarZstd(ctx context.Context, w io.Writer, sources []TarSource) error 
 		return errors.Wrap(err, "start tar")
 	}
 
-	enc, err := zstd.NewWriter(w,
-		zstd.WithEncoderConcurrency(runtime.NumCPU()),
-		zstd.WithWindowSize(zstd.MaxWindowSize))
-	if err != nil {
-		return errors.Join(errors.Wrap(err, "create zstd encoder"), tarCmd.Wait())
-	}
+	enc := zstd.NewWriter(w)
 
 	_, copyErr := io.Copy(enc, tarStdout)
 	encErr := enc.Close()
@@ -412,12 +407,7 @@ func CreateTarZstd(ctx context.Context, w io.Writer, sources []TarSource) error 
 // CreateDeltaTarZstd creates a zstd-compressed tar archive containing the files at
 // relPaths (relative to baseDir).
 func CreateDeltaTarZstd(_ context.Context, w io.Writer, baseDir string, relPaths []string) error {
-	enc, err := zstd.NewWriter(w,
-		zstd.WithEncoderConcurrency(runtime.NumCPU()),
-		zstd.WithWindowSize(zstd.MaxWindowSize))
-	if err != nil {
-		return errors.Wrap(err, "create zstd encoder")
-	}
+	enc := zstd.NewWriter(w)
 
 	tarErr := WriteDeltaTar(enc, baseDir, relPaths)
 	encErr := enc.Close()

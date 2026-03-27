@@ -15,8 +15,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/DataDog/zstd"
 	"github.com/alecthomas/errors"
-	"github.com/klauspost/compress/zstd"
 )
 
 // RestoreConfig holds the parameters for a cache restore operation.
@@ -299,11 +299,8 @@ type extractRule struct {
 // entries to their final destinations based on rules.
 func extractBundleZstd(_ context.Context, r io.Reader, rules []extractRule, defaultDir string, skipExisting bool) error {
 	br := bufio.NewReaderSize(r, 8<<20)
-	dec, err := zstd.NewReader(br, zstd.WithDecoderConcurrency(runtime.NumCPU()))
-	if err != nil {
-		return errors.Wrap(err, "create zstd decoder")
-	}
-	defer dec.Close()
+	dec := zstd.NewReader(br)
+	defer dec.Close() //nolint:errcheck
 
 	targetFn := func(name string) string {
 		for _, rule := range rules {
@@ -325,11 +322,8 @@ func extractBundleZstd(_ context.Context, r io.Reader, rules []extractRule, defa
 
 func extractTarZstd(_ context.Context, r io.Reader, dir string) error {
 	br := bufio.NewReaderSize(r, 8<<20)
-	dec, err := zstd.NewReader(br, zstd.WithDecoderConcurrency(runtime.NumCPU()))
-	if err != nil {
-		return errors.Wrap(err, "create zstd decoder")
-	}
-	defer dec.Close()
+	dec := zstd.NewReader(br)
+	defer dec.Close() //nolint:errcheck
 	if err := extractTarPlatform(dec, dir); err != nil {
 		return err
 	}
