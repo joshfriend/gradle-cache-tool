@@ -3,6 +3,7 @@ package main
 
 import (
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -333,7 +334,19 @@ func clearGradleState(t *testing.T, ctx integrationCtx) {
 	must(t, os.RemoveAll(ctx.gradleUserHome))
 	must(t, os.MkdirAll(ctx.gradleUserHome, 0o755))
 	must(t, os.RemoveAll(filepath.Join(ctx.projectDir, ".gradle")))
-	must(t, os.RemoveAll(filepath.Join(ctx.projectDir, "build")))
+	// Remove build/ dirs from all projects and included builds recursively.
+	must(t, filepath.WalkDir(ctx.projectDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() && d.Name() == "build" {
+			if err := os.RemoveAll(path); err != nil {
+				return err
+			}
+			return filepath.SkipDir
+		}
+		return nil
+	}))
 
 	if _, err := os.Stat(filepath.Join(ctx.gradleUserHome, "caches")); err == nil {
 		t.Fatal("expected caches dir to be gone after cleanup")

@@ -335,20 +335,96 @@ type TarSource struct {
 }
 
 // CacheExclusions are patterns for files and directories that should never be
-// included in cache bundles.
+// included in cache bundles (base or delta).
 var CacheExclusions = []string{
+	// daemon/ contains per-daemon state (registry, logs, pid files) that is tied
+	// to a running Gradle daemon process. Daemons are never reused across CI runs,
+	// so this directory is pure waste in the bundle.
 	"daemon",
+
+	// .tmp/ holds intermediate temp files created during builds. They are
+	// irrelevant after the build finishes and would only inflate the archive.
 	".tmp",
+
+	// gc.properties records the last time Gradle ran its own cache cleanup GC. On
+	// ephemeral CI workers this timestamp is meaningless and Gradle recreates the
+	// file when needed.
 	"gc.properties",
+
+	// *.lock files are advisory filesystem locks held by running Gradle processes.
+	// They are stale after the build and would cause spurious "already locked"
+	// errors if restored on a different machine.
 	"*.lock",
+
+	// cc-keystore holds a randomly generated AES key used to encrypt configuration
+	// cache entries. The key is unique to each machine, so restoring one machine's
+	// keystore onto another causes decryption failures for any existing CC entries.
+	// Gradle generates a fresh keystore (and re-encrypts) when the file is missing.
+	// If the GRADLE_ENCRYPTION_KEY env var is set, Gradle uses that shared key
+	// instead of the keystore, making this file unused entirely.
 	"cc-keystore",
+
+	// file-changes/ contains only last-build.bin, a 1-byte marker whose mtime
+	// records when the previous build finished. Gradle uses it to distrust file
+	// timestamps that match the previous build's end time, forcing a full content
+	// hash instead. After tar extraction every file shares the same mtime, so
+	// including this marker causes Gradle to needlessly rehash thousands of files.
+	// Without it Gradle sets lastBuildTimestamp=0 and trusts all mtimes — strictly
+	// better for restored caches.
+	"file-changes",
+
+	// journal-1/ holds file-access.bin, an indexed cache that maps absolute File
+	// paths to last-access timestamps for Gradle's cache GC (evicts entries not
+	// used in 30 days). The absolute-path keys are wrong on any machine with a
+	// different workspace path, and cache GC is irrelevant on ephemeral CI workers.
+	// Gradle recreates it on first use with inceptionTimestamp=now, so all entries
+	// appear recently accessed and nothing gets prematurely evicted.
+	"journal-1",
+
+	// user-id.txt is a persistent random UUID identifying the Gradle user, written
+	// once and never changed. Bundling it overwrites every CI worker's identity
+	// with the bundle creator's UUID. Gradle generates a new one if missing.
+	"user-id.txt",
 }
 
+// DeltaExclusions are additional file/directory names excluded only from delta
+// bundles. These files are already present in the base bundle and get rewritten
+// every build (Gradle's embedded BTree DB flushes on close even for read-only
+// access), so the delta copy adds negligible value at significant size cost.
+var DeltaExclusions = []string{
+	// fileHashes/ is an indexed cache mapping absolute file paths to (hash, length,
+	// mtime) tuples, letting Gradle skip re-hashing unchanged files. The base
+	// bundle already provides the bulk of entries, and the DB is rewritten on every
+	// build close even for read-only access (BTree compaction), so it always
+	// appears "new". The incremental entries from a single build aren't worth the
+	// transfer cost.
+	"fileHashes",
+
+	// module-metadata.bin is the dependency resolution metadata cache, mapping
+	// (repositoryId, moduleComponentId) to parsed POM/module metadata. Portable
+	// across machines but rewritten on every build due to DB compaction. The base
+	// bundle already has it and a single build rarely adds new dependencies.
+	"module-metadata.bin",
+}
+
+// wrapperZipExclusion excludes the downloaded Gradle distribution zip from
+// wrapper/dists/. After extraction Gradle only needs the unpacked distribution
+// directory; the zip is kept for offline re-extraction but is never read during
+// normal builds. It's typically 100–150 MB and easily re-downloaded if needed.
 const wrapperZipExclusion = "wrapper/dists/*/*/*.zip"
 
 // IsExcludedCache reports whether a file or directory name matches any cache exclusion pattern.
 func IsExcludedCache(name string) bool {
-	for _, pat := range CacheExclusions {
+	return matchesAny(name, CacheExclusions)
+}
+
+// IsDeltaExcluded reports whether a name matches delta-only exclusion patterns.
+func IsDeltaExcluded(name string) bool {
+	return matchesAny(name, DeltaExclusions)
+}
+
+func matchesAny(name string, patterns []string) bool {
+	for _, pat := range patterns {
 		if strings.HasPrefix(pat, "*") {
 			if strings.HasSuffix(name, pat[1:]) {
 				return true
@@ -497,14 +573,14 @@ func CollectNewFiles(realCaches string, since time.Time, gradleHome string) ([]s
 				childRel = rel + "/" + name
 			}
 			if entry.IsDir() {
-				if IsExcludedCache(name) {
+				if IsExcludedCache(name) || IsDeltaExcluded(name) {
 					continue
 				}
 				sem <- struct{}{}
 				wg.Add(1)
 				go walk(filepath.Join(dir, name), childRel)
 			} else if entry.Type().IsRegular() {
-				if IsExcludedCache(name) {
+				if IsExcludedCache(name) || IsDeltaExcluded(name) {
 					continue
 				}
 				if fi, err := entry.Info(); err == nil && fi.ModTime().After(since) {

@@ -28,6 +28,9 @@ func TestIsExcludedCache(t *testing.T) {
 		"cc-keystore",
 		"foo.lock",
 		"gradle-cache.lock",
+		"file-changes",
+		"journal-1",
+		"user-id.txt",
 	}
 	for _, name := range excluded {
 		if !IsExcludedCache(name) {
@@ -46,6 +49,30 @@ func TestIsExcludedCache(t *testing.T) {
 	for _, name := range allowed {
 		if IsExcludedCache(name) {
 			t.Errorf("expected %q to NOT be excluded", name)
+		}
+	}
+}
+
+func TestIsDeltaExcluded(t *testing.T) {
+	excluded := []string{
+		"fileHashes",
+		"module-metadata.bin",
+	}
+	for _, name := range excluded {
+		if !IsDeltaExcluded(name) {
+			t.Errorf("expected %q to be delta-excluded", name)
+		}
+	}
+
+	allowed := []string{
+		"transforms",
+		"build-cache-1",
+		"metadata.bin",
+		"results.bin",
+	}
+	for _, name := range allowed {
+		if IsDeltaExcluded(name) {
+			t.Errorf("expected %q to NOT be delta-excluded", name)
 		}
 	}
 }
