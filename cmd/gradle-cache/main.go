@@ -14,15 +14,19 @@ import (
 	"github.com/joshfriend/gradle-cache-tool/gradlecache"
 )
 
+// version is set at build time via -ldflags.
+var version = "dev"
+
 type CLI struct {
-	LogLevel      string          `help:"Log level." default:"info" enum:"debug,info,warn,error"`
-	Restore       RestoreCmd      `cmd:"" help:"Find the newest cached bundle in history and restore it to GRADLE_USER_HOME."`
-	RestoreDelta  RestoreDeltaCmd `cmd:"" help:"Apply a branch delta bundle on top of an already-restored base cache."`
-	Save          SaveCmd         `cmd:"" help:"Bundle GRADLE_USER_HOME/caches and upload to S3 tagged with a commit SHA."`
-	SaveDelta     SaveDeltaCmd    `cmd:"" help:"Pack files added since the last restore and upload as a branch delta bundle."`
-	StatsdAddr    string          `help:"DogStatsD address (host:port) for emitting metrics. Auto-detected from DD_AGENT_HOST if not set."`
-	DatadogAPIKey string          `help:"DataDog API key for direct metric submission (no agent required)." env:"DATADOG_API_KEY"`
-	MetricsTags   []string        `help:"Additional metric tags in key:value format. May be repeated." name:"metrics-tag"`
+	Version       kong.VersionFlag `help:"Print version and exit."`
+	LogLevel      string           `help:"Log level." default:"info" enum:"debug,info,warn,error"`
+	Restore       RestoreCmd       `cmd:"" help:"Find the newest cached bundle in history and restore it to GRADLE_USER_HOME."`
+	RestoreDelta  RestoreDeltaCmd  `cmd:"" help:"Apply a branch delta bundle on top of an already-restored base cache."`
+	Save          SaveCmd          `cmd:"" help:"Bundle GRADLE_USER_HOME/caches and upload to S3 tagged with a commit SHA."`
+	SaveDelta     SaveDeltaCmd     `cmd:"" help:"Pack files added since the last restore and upload as a branch delta bundle."`
+	StatsdAddr    string           `help:"DogStatsD address (host:port) for emitting metrics. Auto-detected from DD_AGENT_HOST if not set."`
+	DatadogAPIKey string           `help:"DataDog API key for direct metric submission (no agent required)." env:"DATADOG_API_KEY"`
+	MetricsTags   []string         `help:"Additional metric tags in key:value format. May be repeated." name:"metrics-tag"`
 }
 
 type backendFlags struct {
@@ -171,8 +175,10 @@ func main() {
 		kong.UsageOnError(),
 		kong.HelpOptions{Compact: true},
 		kong.BindTo(ctx, (*context.Context)(nil)),
+		kong.Vars{"version": version},
 	)
 	setupLogger(cli.LogLevel)
+	slog.Debug("starting gradle-cache", "version", version)
 
 	mf := &gradlecache.MetricsFlags{
 		StatsdAddr:    cli.StatsdAddr,

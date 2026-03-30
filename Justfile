@@ -30,7 +30,7 @@ build GOOS=(GOOS) GOARCH=(GOARCH):
     echo "Building dist/gradle-cache-{{ GOOS }}-{{ GOARCH }}"
     CGO_ENABLED=0 GOOS={{ GOOS }} GOARCH={{ GOARCH }} \
         go build -trimpath -o {{ RELEASE }}/gradle-cache-{{ GOOS }}-{{ GOARCH }} \
-        -ldflags "-s -w" \
+        -ldflags "-s -w -X main.version={{ VERSION }}" \
         ./cmd/gradle-cache
     test "{{ GOOS }}-{{ GOARCH }}" = "$(go env GOOS)-$(go env GOARCH)" && \
         (cd {{ RELEASE }} && ln -sf gradle-cache-{{ GOOS }}-{{ GOARCH }} gradle-cache)
