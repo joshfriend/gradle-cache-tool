@@ -3,8 +3,11 @@ package gradlecache
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/xml"
 	"fmt"
+	"hash"
 	"io"
 	"net/http"
 	"net/url"
@@ -13,6 +16,7 @@ import (
 	"sync"
 
 	"github.com/alecthomas/errors"
+	crc64nvme "github.com/minio/crc64nvme"
 )
 
 // bundleStatInfo holds opaque metadata returned by bundleStore.stat().
@@ -205,7 +209,30 @@ func (c *s3Client) put(ctx context.Context, bucket, key string, r io.ReadSeeker,
 	return c.putMultipart(ctx, bucket, key, r, size, contentType)
 }
 
-func (c *s3Client) putSingle(ctx context.Context, bucket, key string, r io.Reader, size int64, contentType string) error {
+// crc64Of computes a CRC64-NVME checksum of the data from r, then seeks back.
+func crc64Of(r io.ReadSeeker) (string, error) {
+	h := crc64nvme.New()
+	if _, err := io.Copy(h, r); err != nil {
+		return "", err
+	}
+	if _, err := r.Seek(0, io.SeekStart); err != nil {
+		return "", err
+	}
+	return crc64Base64(h), nil
+}
+
+// crc64Base64 returns the base64-encoded 8-byte big-endian CRC64-NVME value.
+func crc64Base64(h hash.Hash64) string {
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], h.Sum64())
+	return base64.StdEncoding.EncodeToString(buf[:])
+}
+
+func (c *s3Client) putSingle(ctx context.Context, bucket, key string, r io.ReadSeeker, size int64, contentType string) error {
+	checksum, err := crc64Of(r)
+	if err != nil {
+		return errors.Wrap(err, "compute CRC64-NVME checksum")
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.objectURL(bucket, key), r)
 	if err != nil {
 		return err
@@ -214,6 +241,8 @@ func (c *s3Client) putSingle(ctx context.Context, bucket, key string, r io.Reade
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
+	req.Header.Set("X-Amz-Checksum-Crc64nvme", checksum)
+	req.Header.Set("X-Amz-Checksum-Algorithm", "CRC64NVME")
 	c.sign(req)
 	resp, err := c.http.Do(req) //nolint:gosec
 	if err != nil {
@@ -235,13 +264,14 @@ func (c *s3Client) putMultipart(ctx context.Context, bucket, key string, r io.Re
 
 	numParts := int((size + uploadPartSize - 1) / uploadPartSize)
 
-	type partResult struct {
-		num  int
-		etag string
-		err  error
+	type partResultMsg struct {
+		num      int
+		etag     string
+		checksum string
+		err      error
 	}
 
-	results := make(chan partResult, numParts)
+	results := make(chan partResultMsg, numParts)
 	work := make(chan int, numParts)
 	for i := range numParts {
 		work <- i
@@ -258,8 +288,8 @@ func (c *s3Client) putMultipart(ctx context.Context, bucket, key string, r io.Re
 				offset := int64(seq) * uploadPartSize
 				partSize := min(uploadPartSize, size-offset)
 				sr := io.NewSectionReader(r.(io.ReaderAt), offset, partSize)
-				etag, err := c.uploadPart(ctx, bucket, key, uploadID, partNum, sr, partSize)
-				results <- partResult{num: partNum, etag: etag, err: err}
+				res, err := c.uploadPart(ctx, bucket, key, uploadID, partNum, sr, partSize)
+				results <- partResultMsg{num: partNum, etag: res.etag, checksum: res.checksum, err: err}
 			}
 		}()
 	}
@@ -270,9 +300,10 @@ func (c *s3Client) putMultipart(ctx context.Context, bucket, key string, r io.Re
 	}()
 
 	type completedPart struct {
-		XMLName    xml.Name `xml:"Part"`
-		PartNumber int      `xml:"PartNumber"`
-		ETag       string   `xml:"ETag"`
+		XMLName           xml.Name `xml:"Part"`
+		PartNumber        int      `xml:"PartNumber"`
+		ETag              string   `xml:"ETag"`
+		ChecksumCRC64NVME string   `xml:"ChecksumCRC64NVME,omitempty"`
 	}
 	parts := make([]completedPart, numParts)
 	var firstErr error
@@ -281,7 +312,7 @@ func (c *s3Client) putMultipart(ctx context.Context, bucket, key string, r io.Re
 			firstErr = r.err
 		}
 		if r.err == nil {
-			parts[r.num-1] = completedPart{PartNumber: r.num, ETag: r.etag}
+			parts[r.num-1] = completedPart{PartNumber: r.num, ETag: r.etag, ChecksumCRC64NVME: r.checksum}
 		}
 	}
 
@@ -302,6 +333,7 @@ func (c *s3Client) createMultipartUpload(ctx context.Context, bucket, key, conte
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
+	req.Header.Set("X-Amz-Checksum-Algorithm", "CRC64NVME")
 	c.sign(req)
 	resp, err := c.http.Do(req) //nolint:gosec
 	if err != nil {
@@ -321,24 +353,40 @@ func (c *s3Client) createMultipartUpload(ctx context.Context, bucket, key, conte
 	return result.UploadID, nil
 }
 
-func (c *s3Client) uploadPart(ctx context.Context, bucket, key, uploadID string, partNum int, r io.Reader, size int64) (string, error) {
+// uploadPartResult holds both the ETag and CRC64 checksum for a completed part.
+type uploadPartResult struct {
+	etag     string
+	checksum string // base64-encoded CRC64-NVME
+}
+
+func (c *s3Client) uploadPart(ctx context.Context, bucket, key, uploadID string, partNum int, r io.ReadSeeker, size int64) (uploadPartResult, error) {
+	h := crc64nvme.New()
+	if _, err := io.Copy(h, r); err != nil {
+		return uploadPartResult{}, err
+	}
+	if _, err := r.Seek(0, io.SeekStart); err != nil {
+		return uploadPartResult{}, err
+	}
+	checksum := crc64Base64(h)
+
 	u := fmt.Sprintf("%s?partNumber=%d&uploadId=%s", c.objectURL(bucket, key), partNum, url.QueryEscape(uploadID))
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u, r)
 	if err != nil {
-		return "", err
+		return uploadPartResult{}, err
 	}
 	req.ContentLength = size
+	req.Header.Set("X-Amz-Checksum-Crc64nvme", checksum)
 	c.sign(req)
 	resp, err := c.http.Do(req) //nolint:gosec
 	if err != nil {
-		return "", err
+		return uploadPartResult{}, err
 	}
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	resp.Body.Close() //nolint:errcheck,gosec
 	if resp.StatusCode != http.StatusOK {
-		return "", errors.Errorf("s3 UploadPart %s/%s part %d: status %d: %s", bucket, key, partNum, resp.StatusCode, body)
+		return uploadPartResult{}, errors.Errorf("s3 UploadPart %s/%s part %d: status %d: %s", bucket, key, partNum, resp.StatusCode, body)
 	}
-	return resp.Header.Get("ETag"), nil
+	return uploadPartResult{etag: resp.Header.Get("ETag"), checksum: checksum}, nil
 }
 
 func (c *s3Client) completeMultipartUpload(ctx context.Context, bucket, key, uploadID string, parts any) error {
@@ -396,15 +444,16 @@ func (c *s3Client) putStreamingMultipart(ctx context.Context, bucket, key string
 		num  int
 		data []byte
 	}
-	type partResult struct {
-		num  int
-		size int
-		etag string
-		err  error
+	type streamPartResult struct {
+		num      int
+		size     int
+		etag     string
+		checksum string
+		err      error
 	}
 
 	jobs := make(chan partJob, uploadWorkers)
-	results := make(chan partResult, uploadWorkers)
+	results := make(chan streamPartResult, uploadWorkers)
 
 	var wg sync.WaitGroup
 	for range uploadWorkers {
@@ -412,9 +461,9 @@ func (c *s3Client) putStreamingMultipart(ctx context.Context, bucket, key string
 		go func() {
 			defer wg.Done()
 			for job := range jobs {
-				etag, err := c.uploadPart(ctx, bucket, key, uploadID, job.num,
+				res, err := c.uploadPart(ctx, bucket, key, uploadID, job.num,
 					bytes.NewReader(job.data), int64(len(job.data)))
-				results <- partResult{num: job.num, size: len(job.data), etag: etag, err: err}
+				results <- streamPartResult{num: job.num, size: len(job.data), etag: res.etag, checksum: res.checksum, err: err}
 			}
 		}()
 	}
@@ -439,9 +488,10 @@ func (c *s3Client) putStreamingMultipart(ctx context.Context, bucket, key string
 	}()
 
 	type completedPart struct {
-		XMLName    xml.Name `xml:"Part"`
-		PartNumber int      `xml:"PartNumber"`
-		ETag       string   `xml:"ETag"`
+		XMLName           xml.Name `xml:"Part"`
+		PartNumber        int      `xml:"PartNumber"`
+		ETag              string   `xml:"ETag"`
+		ChecksumCRC64NVME string   `xml:"ChecksumCRC64NVME,omitempty"`
 	}
 	var parts []completedPart
 	var totalSize int64
@@ -451,7 +501,7 @@ func (c *s3Client) putStreamingMultipart(ctx context.Context, bucket, key string
 			firstErr = r.err
 		}
 		if r.err == nil {
-			parts = append(parts, completedPart{PartNumber: r.num, ETag: r.etag})
+			parts = append(parts, completedPart{PartNumber: r.num, ETag: r.etag, ChecksumCRC64NVME: r.checksum})
 			totalSize += int64(r.size)
 		}
 	}
