@@ -460,7 +460,7 @@ func TestExtractZstdDrainsBufferedReaderToEOF(t *testing.T) {
 		projectDir := t.TempDir()
 		cb := &countingBody{r: bytes.NewReader(archive.Bytes())}
 
-		err := extractBundleZstd(ctx, cb, []extractRule{
+		_, err := extractBundleZstd(ctx, cb, []extractRule{
 			{prefix: "caches/", baseDir: gradleHome},
 		}, projectDir, false)
 		must(t, err)

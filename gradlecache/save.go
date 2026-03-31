@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -187,13 +188,16 @@ func Save(ctx context.Context, cfg SaveConfig) error {
 	log.Info("saving bundle", "commit", cfg.Commit[:min(8, len(cfg.Commit))], "cache-key", cfg.CacheKey)
 	saveStart := time.Now()
 
+	// Wrap the archive→upload boundary to measure upload wait time.
+	uploadTiming := &timingReader{r: pr}
+
 	var archiveErr error
 	go func() {
 		archiveErr = CreateTarZstd(ctx, pw, sources)
 		pw.CloseWithError(archiveErr) //nolint:errcheck,gosec
 	}()
 
-	size, err := store.putStream(ctx, cfg.Commit, cfg.CacheKey, pr)
+	size, err := store.putStream(ctx, cfg.Commit, cfg.CacheKey, uploadTiming)
 	pr.Close() //nolint:errcheck,gosec
 	if archiveErr != nil {
 		return errors.Wrap(archiveErr, "create bundle archive")
@@ -204,9 +208,33 @@ func Save(ctx context.Context, cfg SaveConfig) error {
 
 	elapsed := time.Since(saveStart)
 	mbps := float64(size) / elapsed.Seconds() / 1e6
-	log.Info("archive+upload complete", "duration", elapsed,
+
+	// Upload pipeline: disk read (tar) → compress (zstd) → upload (S3).
+	// uploadTiming.blocked = time S3 upload spent waiting for compressed bytes
+	// (i.e. archive busy time). elapsed - uploadTiming.blocked = upload busy time.
+	archiveBusy := uploadTiming.blocked
+	uploadBusy := elapsed - archiveBusy
+	var bottleneck string
+	if archiveBusy > uploadBusy {
+		bottleneck = "archive"
+	} else {
+		bottleneck = "upload"
+	}
+
+	attrs := []any{
+		"duration", elapsed.Round(time.Millisecond),
 		"size_mb", fmt.Sprintf("%.1f", float64(size)/1e6),
-		"speed_mbps", fmt.Sprintf("%.1f", mbps))
+		"speed_mbps", fmt.Sprintf("%.1f", mbps),
+		"bottleneck", bottleneck,
+	}
+	if archiveBusy > 0 {
+		attrs = append(attrs, "archive_mbps", fmt.Sprintf("%.1f", float64(size)/archiveBusy.Seconds()/1e6))
+	}
+	if uploadBusy > 0 {
+		attrs = append(attrs, "upload_mbps", fmt.Sprintf("%.1f", float64(size)/uploadBusy.Seconds()/1e6))
+	}
+	log.Info("archive+upload complete", attrs...)
+
 	log.Info("saved bundle", "commit", cfg.Commit[:min(8, len(cfg.Commit))], "cache-key", cfg.CacheKey)
 	cfg.Metrics.Distribution("gradle_cache.save.duration_ms", float64(elapsed.Milliseconds()), "cache_key:"+cfg.CacheKey)
 	cfg.Metrics.Distribution("gradle_cache.save.size_bytes", float64(size), "cache_key:"+cfg.CacheKey)
@@ -437,31 +465,35 @@ func matchesAny(name string, patterns []string) bool {
 }
 
 // CreateTarZstd creates a zstd-compressed tar archive from the given sources.
+// If pzstd is available it is used to produce a multi-frame archive that can
+// be decompressed in parallel on restore. Otherwise klauspost is used.
 func CreateTarZstd(ctx context.Context, w io.Writer, sources []TarSource) error {
-	args := []string{"-chf", "-"}
+	tarArgs := []string{"-chf", "-"}
 	for _, pat := range CacheExclusions {
-		args = append(args, "--exclude", pat)
+		tarArgs = append(tarArgs, "--exclude", pat)
 	}
-	args = append(args, "--exclude", wrapperZipExclusion)
+	tarArgs = append(tarArgs, "--exclude", wrapperZipExclusion)
 	for _, src := range sources {
-		args = append(args, "-C", src.BaseDir, src.Path)
+		tarArgs = append(tarArgs, "-C", src.BaseDir, src.Path)
 	}
-	tarCmd := exec.CommandContext(ctx, "tar", args...) //nolint:gosec
 
+	if pzstdPath, err := exec.LookPath("pzstd"); err == nil {
+		return createTarPzstd(ctx, w, tarArgs, pzstdPath)
+	}
+
+	// Fallback: klauspost in-process encoder.
+	tarCmd := exec.CommandContext(ctx, "tar", tarArgs...) //nolint:gosec
 	tarStdout, err := tarCmd.StdoutPipe()
 	if err != nil {
 		return errors.Wrap(err, "tar stdout pipe")
 	}
-
 	var tarStderr bytes.Buffer
 	tarCmd.Stderr = &tarStderr
-
 	if err := tarCmd.Start(); err != nil {
 		return errors.Wrap(err, "start tar")
 	}
 
-	enc, err := zstd.NewWriter(w,
-		zstd.WithEncoderConcurrency(runtime.GOMAXPROCS(0)))
+	enc, err := zstd.NewWriter(w, zstd.WithEncoderConcurrency(runtime.GOMAXPROCS(0)))
 	if err != nil {
 		return errors.Join(errors.Wrap(err, "create zstd encoder"), tarCmd.Wait())
 	}
@@ -480,6 +512,54 @@ func CreateTarZstd(ctx context.Context, w io.Writer, sources []TarSource) error 
 	}
 	if encErr != nil {
 		errs = append(errs, errors.Wrap(encErr, "close zstd encoder"))
+	}
+	return errors.Join(errs...)
+}
+
+// createTarPzstd pipes tar output through pzstd to produce a multi-frame zstd
+// archive. An OS-level pipe connects the two processes directly without
+// buffering through Go.
+func createTarPzstd(ctx context.Context, w io.Writer, tarArgs []string, pzstdPath string) error {
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		return errors.Wrap(err, "create tar-pzstd pipe")
+	}
+
+	tarCmd := exec.CommandContext(ctx, "tar", tarArgs...) //nolint:gosec
+	tarCmd.Stdout = pw
+	var tarStderr bytes.Buffer
+	tarCmd.Stderr = &tarStderr
+
+	procs := strconv.Itoa(runtime.GOMAXPROCS(0))
+	pzstdCmd := exec.CommandContext(ctx, pzstdPath, "-p", procs, "-c") //nolint:gosec
+	pzstdCmd.Stdin = pr
+	pzstdCmd.Stdout = w
+	var pzstdStderr bytes.Buffer
+	pzstdCmd.Stderr = &pzstdStderr
+
+	if err := tarCmd.Start(); err != nil {
+		pr.Close() //nolint:errcheck,gosec
+		pw.Close() //nolint:errcheck,gosec
+		return errors.Wrap(err, "start tar")
+	}
+	pw.Close() // parent no longer needs write end //nolint:errcheck,gosec
+
+	if err := pzstdCmd.Start(); err != nil {
+		pr.Close()    //nolint:errcheck,gosec
+		tarCmd.Wait() //nolint:errcheck,gosec
+		return errors.Wrap(err, "start pzstd")
+	}
+	pr.Close() // parent no longer needs read end //nolint:errcheck,gosec
+
+	pzstdWaitErr := pzstdCmd.Wait()
+	tarWaitErr := tarCmd.Wait()
+
+	var errs []error
+	if tarWaitErr != nil {
+		errs = append(errs, errors.Errorf("tar: %w: %s", tarWaitErr, tarStderr.String()))
+	}
+	if pzstdWaitErr != nil {
+		errs = append(errs, errors.Errorf("pzstd: %w: %s", pzstdWaitErr, pzstdStderr.String()))
 	}
 	return errors.Join(errs...)
 }

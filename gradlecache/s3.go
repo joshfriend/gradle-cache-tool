@@ -9,7 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -348,9 +348,11 @@ func resolveAWSCredentials(region string) (awsCreds, error) {
 		if roleARN == "" {
 			return awsCreds{}, errors.New("AWS_WEB_IDENTITY_TOKEN_FILE set but AWS_ROLE_ARN is missing")
 		}
+		slog.Info("resolving AWS credentials via web identity", "token_file", tokenFile, "role_arn", roleARN)
 		return assumeRoleWithWebIdentity(tokenFile, roleARN, region)
 	}
 	if id := os.Getenv("AWS_ACCESS_KEY_ID"); id != "" {
+		slog.Info("resolving AWS credentials via environment variables")
 		return awsCreds{
 			AccessKeyID:     id,
 			SecretAccessKey: os.Getenv("AWS_SECRET_ACCESS_KEY"),
@@ -358,9 +360,11 @@ func resolveAWSCredentials(region string) (awsCreds, error) {
 		}, nil
 	}
 	if creds, err := credentialsFromFile(); err == nil {
+		slog.Info("resolving AWS credentials via credentials file")
 		return creds, nil
 	}
 	if creds, err := credentialsFromIMDS(); err == nil {
+		slog.Info("resolving AWS credentials via IMDS")
 		return creds, nil
 	}
 	return awsCreds{}, errors.New("no AWS credentials found (checked env, ~/.aws/credentials, IMDS)")
