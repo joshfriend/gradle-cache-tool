@@ -33560,10 +33560,10 @@ async function install() {
 
   let url;
   if (version === "latest") {
-    url = `https://github.com/joshfriend/gradle-cache-tool/releases/latest/download/gradle-cache-${suffix}`;
+    url = `https://github.com/joshfriend/bundle-cache/releases/latest/download/gradle-cache-${suffix}`;
   } else {
     const tag = version.startsWith("v") ? version : `v${version}`;
-    url = `https://github.com/joshfriend/gradle-cache-tool/releases/download/${tag}/gradle-cache-${suffix}`;
+    url = `https://github.com/joshfriend/bundle-cache/releases/download/${tag}/gradle-cache-${suffix}`;
   }
 
   core.info(`Downloading gradle-cache from ${url}`);

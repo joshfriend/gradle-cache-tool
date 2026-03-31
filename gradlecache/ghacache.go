@@ -79,7 +79,7 @@ func ghaCacheKey(commit, cacheKey string) string {
 // cache key so different cache-key values don't collide even if they share a
 // commit.
 func ghaCacheVersion(cacheKey string) string {
-	h := sha256.Sum256([]byte("gradle-cache-tool:" + cacheKey))
+	h := sha256.Sum256([]byte("bundle-cache:" + cacheKey))
 	return fmt.Sprintf("%x", h)
 }
 

@@ -28,4 +28,4 @@ formatters:
   settings:
     goimports:
       local-prefixes:
-        - github.com/joshfriend/gradle-cache-tool
+        - github.com/joshfriend/bundle-cache

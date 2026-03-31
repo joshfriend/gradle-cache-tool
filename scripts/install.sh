@@ -1,13 +1,13 @@
 #!/bin/sh
 # Install gradle-cache. Usage:
-#   curl -fsSL https://raw.githubusercontent.com/joshfriend/gradle-cache-tool/main/scripts/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/joshfriend/bundle-cache/main/scripts/install.sh | sh
 #
 # Environment variables:
 #   VERSION            - specific release tag to install (default: latest)
 #   INSTALL_DIR        - installation directory (default: ~/.local/bin)
 set -e
 
-REPO="joshfriend/gradle-cache-tool"
+REPO="joshfriend/bundle-cache"
 BINARY="gradle-cache"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 

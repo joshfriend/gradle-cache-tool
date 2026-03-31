@@ -1,6 +1,6 @@
 name: Gradle Cache
 description: >
-  Save and restore Gradle build caches using gradle-cache-tool.
+  Save and restore Gradle build caches using bundle-cache.
   Restores a cache bundle before the build and automatically saves it afterward.
   Uses the GitHub Actions cache by default — no S3 setup required.
 author: joshfriend

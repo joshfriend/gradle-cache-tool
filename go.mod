@@ -1,4 +1,4 @@
-module github.com/joshfriend/gradle-cache-tool
+module github.com/joshfriend/bundle-cache
 
 go 1.25.0
 

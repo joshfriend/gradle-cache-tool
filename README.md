@@ -82,7 +82,7 @@ with S3 or a cachew server as the storage backend.
 ## Installation
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/joshfriend/gradle-cache-tool/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/joshfriend/bundle-cache/main/scripts/install.sh | sh
 ```
 
 This installs the latest release to `~/.local/bin`. Set `INSTALL_DIR` to override the destination, or `VERSION` to pin a specific release tag.
