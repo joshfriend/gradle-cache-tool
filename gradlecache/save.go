@@ -478,42 +478,12 @@ func CreateTarZstd(ctx context.Context, w io.Writer, sources []TarSource) error 
 	}
 
 	if pzstdPath, err := exec.LookPath("pzstd"); err == nil {
+		slog.Debug("using pzstd multi-frame encoder", "path", pzstdPath)
 		return createTarPzstd(ctx, w, tarArgs, pzstdPath)
 	}
 
-	// Fallback: klauspost in-process encoder.
-	tarCmd := exec.CommandContext(ctx, "tar", tarArgs...) //nolint:gosec
-	tarStdout, err := tarCmd.StdoutPipe()
-	if err != nil {
-		return errors.Wrap(err, "tar stdout pipe")
-	}
-	var tarStderr bytes.Buffer
-	tarCmd.Stderr = &tarStderr
-	if err := tarCmd.Start(); err != nil {
-		return errors.Wrap(err, "start tar")
-	}
-
-	enc, err := zstd.NewWriter(w, zstd.WithEncoderConcurrency(runtime.GOMAXPROCS(0)))
-	if err != nil {
-		return errors.Join(errors.Wrap(err, "create zstd encoder"), tarCmd.Wait())
-	}
-
-	_, copyErr := io.Copy(enc, tarStdout)
-	encErr := enc.Close()
-	tarStdout.Close() //nolint:errcheck,gosec
-	tarErr := tarCmd.Wait()
-
-	var errs []error
-	if tarErr != nil {
-		errs = append(errs, errors.Errorf("tar: %w: %s", tarErr, tarStderr.String()))
-	}
-	if copyErr != nil {
-		errs = append(errs, errors.Wrap(copyErr, "compress stream"))
-	}
-	if encErr != nil {
-		errs = append(errs, errors.Wrap(encErr, "close zstd encoder"))
-	}
-	return errors.Join(errs...)
+	slog.Debug("using klauspost single-frame encoder")
+	return createTarKlauspost(ctx, w, tarArgs)
 }
 
 // createTarPzstd pipes tar output through pzstd to produce a multi-frame zstd
@@ -560,6 +530,42 @@ func createTarPzstd(ctx context.Context, w io.Writer, tarArgs []string, pzstdPat
 	}
 	if pzstdWaitErr != nil {
 		errs = append(errs, errors.Errorf("pzstd: %w: %s", pzstdWaitErr, pzstdStderr.String()))
+	}
+	return errors.Join(errs...)
+}
+
+// createTarKlauspost pipes tar output through the klauspost zstd encoder.
+func createTarKlauspost(ctx context.Context, w io.Writer, tarArgs []string) error {
+	tarCmd := exec.CommandContext(ctx, "tar", tarArgs...) //nolint:gosec
+	tarStdout, err := tarCmd.StdoutPipe()
+	if err != nil {
+		return errors.Wrap(err, "tar stdout pipe")
+	}
+	var tarStderr bytes.Buffer
+	tarCmd.Stderr = &tarStderr
+	if err := tarCmd.Start(); err != nil {
+		return errors.Wrap(err, "start tar")
+	}
+
+	enc, err := zstd.NewWriter(w, zstd.WithEncoderConcurrency(runtime.GOMAXPROCS(0)))
+	if err != nil {
+		return errors.Join(errors.Wrap(err, "create zstd encoder"), tarCmd.Wait())
+	}
+
+	_, copyErr := io.Copy(enc, tarStdout)
+	encErr := enc.Close()
+	tarStdout.Close() //nolint:errcheck,gosec
+	tarErr := tarCmd.Wait()
+
+	var errs []error
+	if tarErr != nil {
+		errs = append(errs, errors.Errorf("tar: %w: %s", tarErr, tarStderr.String()))
+	}
+	if copyErr != nil {
+		errs = append(errs, errors.Wrap(copyErr, "compress stream"))
+	}
+	if encErr != nil {
+		errs = append(errs, errors.Wrap(encErr, "close zstd encoder"))
 	}
 	return errors.Join(errs...)
 }

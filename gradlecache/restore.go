@@ -550,10 +550,10 @@ func extractBundleZstd(ctx context.Context, r io.Reader, rules []extractRule, de
 		return pipelineStats{}, err
 	}
 	if magic >= pzstdMagicMin && magic <= pzstdMagicMax {
-		slog.Debug("detected multi-frame pzstd bundle")
+		slog.Debug("using multi-frame parallel decoder")
 		return extractBundleZstdMultiFrame(ctx, br, dlTiming, pipeStart, rules, defaultDir, skipExisting)
 	}
-	slog.Debug("detected single-frame zstd bundle")
+	slog.Debug("using klauspost single-frame decoder")
 	return extractBundleZstdSingleFrame(br, dlTiming, pipeStart, rules, defaultDir, skipExisting)
 }
 
