@@ -538,8 +538,31 @@ func WriteDeltaTar(w io.Writer, baseDir string, relPaths []string) error {
 	return tw.Close()
 }
 
+// ImmutableWorkspaceParents lists directory names whose immediate children are
+// immutable workspace directories (e.g. transforms/<hash>/, groovy-dsl/<hash>/).
+//
+// Each workspace is an atomic unit: Gradle creates all files together via an
+// atomic directory rename, and expects all files to be present when reading.
+// However, mtime skew can occur across delta cycles: after restoring base +
+// delta, the base provides output files (old mtime, before the marker) while
+// the delta overwrites metadata files like metadata.bin and results.bin (new
+// mtime, after the marker). A naive per-file mtime check would capture only
+// the metadata files, producing a partial workspace in the next delta. When
+// that partial delta is applied to a different base that lacks the workspace
+// hash, Gradle crashes with "Could not read workspace metadata".
+//
+// The fix: when ANY file in a workspace is newer than the marker, include ALL
+// files from that workspace in the delta.
+var ImmutableWorkspaceParents = map[string]bool{
+	"transforms": true,
+	"groovy-dsl": true,
+	"kotlin-dsl": true,
+}
+
 // CollectNewFiles walks realCaches in parallel and returns paths of regular files
-// with mtime strictly after since.
+// with mtime strictly after since. For directories listed in ImmutableWorkspaceParents,
+// if any file in a child workspace is newer than since, all files in that workspace
+// are included to prevent partial restores.
 func CollectNewFiles(realCaches string, since time.Time, gradleHome string) ([]string, error) {
 	workers := min(8, runtime.NumCPU())
 	sem := make(chan struct{}, workers)
@@ -548,6 +571,76 @@ func CollectNewFiles(realCaches string, since time.Time, gradleHome string) ([]s
 	var allFiles []string
 	var firstErr error
 	var wg sync.WaitGroup
+
+	// collectAll recursively collects ALL regular files under dir, regardless of mtime.
+	collectAll := func(dir, rel string) []string {
+		var files []string
+		_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+			if d.IsDir() {
+				if IsExcludedCache(d.Name()) {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if d.Type().IsRegular() && !IsExcludedCache(d.Name()) {
+				childRel, _ := filepath.Rel(dir, path)
+				files = append(files, filepath.Join("caches", rel, childRel))
+			}
+			return nil
+		})
+		return files
+	}
+
+	// walkWorkspaceParent handles directories like transforms/ whose children
+	// are atomic workspace directories. For each child, if any file is newer
+	// than since, all files are included.
+	walkWorkspaceParent := func(dir, rel string) {
+		defer wg.Done()
+
+		entries, err := os.ReadDir(dir)
+		<-sem
+
+		if err != nil {
+			mu.Lock()
+			if firstErr == nil {
+				firstErr = err
+			}
+			mu.Unlock()
+			return
+		}
+
+		for _, entry := range entries {
+			if !entry.IsDir() || IsExcludedCache(entry.Name()) {
+				continue
+			}
+			childDir := filepath.Join(dir, entry.Name())
+			childRel := rel + "/" + entry.Name()
+
+			hasNew := false
+			filepath.WalkDir(childDir, func(_ string, d os.DirEntry, err error) error {
+				if err != nil || d.IsDir() {
+					return nil
+				}
+				if fi, e := d.Info(); e == nil && fi.ModTime().After(since) {
+					hasNew = true
+					return filepath.SkipAll
+				}
+				return nil
+			})
+
+			if hasNew {
+				files := collectAll(childDir, childRel)
+				if len(files) > 0 {
+					mu.Lock()
+					allFiles = append(allFiles, files...)
+					mu.Unlock()
+				}
+			}
+		}
+	}
 
 	var walk func(dir, rel string)
 	walk = func(dir, rel string) {
@@ -576,9 +669,15 @@ func CollectNewFiles(realCaches string, since time.Time, gradleHome string) ([]s
 				if IsExcludedCache(name) || IsDeltaExcluded(name) {
 					continue
 				}
-				sem <- struct{}{}
-				wg.Add(1)
-				go walk(filepath.Join(dir, name), childRel)
+				if ImmutableWorkspaceParents[name] {
+					sem <- struct{}{}
+					wg.Add(1)
+					go walkWorkspaceParent(filepath.Join(dir, name), childRel)
+				} else {
+					sem <- struct{}{}
+					wg.Add(1)
+					go walk(filepath.Join(dir, name), childRel)
+				}
 			} else if entry.Type().IsRegular() {
 				if IsExcludedCache(name) || IsDeltaExcluded(name) {
 					continue

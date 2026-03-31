@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // ─── Pure unit tests ────────────────────────────────────────────────────────
@@ -73,6 +74,80 @@ func TestIsDeltaExcluded(t *testing.T) {
 	for _, name := range allowed {
 		if IsDeltaExcluded(name) {
 			t.Errorf("expected %q to NOT be delta-excluded", name)
+		}
+	}
+}
+
+// TestCollectNewFilesWorkspaceCompleteness verifies that CollectNewFiles
+// includes ALL files from an immutable workspace when any file is new.
+func TestCollectNewFilesWorkspaceCompleteness(t *testing.T) {
+	cacheDir := t.TempDir()
+	gradleHome := filepath.Join(t.TempDir(), "gradle-home")
+	must(t, os.MkdirAll(gradleHome, 0o755))
+
+	wsDir := filepath.Join(cacheDir, "8.14.3", "transforms", "abc123")
+	must(t, os.MkdirAll(filepath.Join(wsDir, "transformed"), 0o755))
+
+	oldTime := time.Now().Add(-10 * time.Second)
+	newTime := time.Now()
+	since := time.Now().Add(-5 * time.Second)
+
+	// metadata.bin — old (before marker).
+	must(t, os.WriteFile(filepath.Join(wsDir, "metadata.bin"), []byte("meta"), 0o644))
+	must(t, os.Chtimes(filepath.Join(wsDir, "metadata.bin"), oldTime, oldTime))
+
+	// results.bin — old.
+	must(t, os.WriteFile(filepath.Join(wsDir, "results.bin"), []byte("res"), 0o644))
+	must(t, os.Chtimes(filepath.Join(wsDir, "results.bin"), oldTime, oldTime))
+
+	// transformed/output.bin — NEW (after marker).
+	must(t, os.WriteFile(filepath.Join(wsDir, "transformed", "output.bin"), []byte("out"), 0o644))
+	must(t, os.Chtimes(filepath.Join(wsDir, "transformed", "output.bin"), newTime, newTime))
+
+	files, err := CollectNewFiles(cacheDir, since, gradleHome)
+	must(t, err)
+
+	// All 3 files must be collected because output.bin is new and the
+	// workspace is under an ImmutableWorkspaceParent (transforms/).
+	fileSet := make(map[string]bool)
+	for _, f := range files {
+		fileSet[f] = true
+	}
+	for _, expected := range []string{
+		"caches/8.14.3/transforms/abc123/metadata.bin",
+		"caches/8.14.3/transforms/abc123/results.bin",
+		"caches/8.14.3/transforms/abc123/transformed/output.bin",
+	} {
+		if !fileSet[expected] {
+			t.Errorf("expected %q in collected files, got: %v", expected, files)
+		}
+	}
+}
+
+// TestCollectNewFilesWorkspaceSkipped verifies that an immutable workspace
+// where NO files are new is entirely skipped.
+func TestCollectNewFilesWorkspaceSkipped(t *testing.T) {
+	cacheDir := t.TempDir()
+	gradleHome := filepath.Join(t.TempDir(), "gradle-home")
+	must(t, os.MkdirAll(gradleHome, 0o755))
+
+	wsDir := filepath.Join(cacheDir, "8.14.3", "transforms", "abc123")
+	must(t, os.MkdirAll(filepath.Join(wsDir, "transformed"), 0o755))
+
+	oldTime := time.Now().Add(-10 * time.Second)
+	since := time.Now().Add(-5 * time.Second)
+
+	must(t, os.WriteFile(filepath.Join(wsDir, "metadata.bin"), []byte("meta"), 0o644))
+	must(t, os.Chtimes(filepath.Join(wsDir, "metadata.bin"), oldTime, oldTime))
+	must(t, os.WriteFile(filepath.Join(wsDir, "transformed", "output.bin"), []byte("out"), 0o644))
+	must(t, os.Chtimes(filepath.Join(wsDir, "transformed", "output.bin"), oldTime, oldTime))
+
+	files, err := CollectNewFiles(cacheDir, since, gradleHome)
+	must(t, err)
+
+	for _, f := range files {
+		if strings.Contains(f, "transforms/abc123") {
+			t.Errorf("workspace abc123 should have been skipped, but found: %s", f)
 		}
 	}
 }
