@@ -30,7 +30,7 @@ jobs:
         with:
           fetch-depth: 0  # full history needed for cache lookup
 
-      - uses: joshfriend/bundle-cache@v1  # restores cache here
+      - uses: block/bundle-cache@v1  # restores cache here
 
       - run: ./gradlew assembleDebug            # your build
 
@@ -82,7 +82,7 @@ with S3 or a cachew server as the storage backend.
 ## Installation
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/joshfriend/bundle-cache/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/block/bundle-cache/main/scripts/install.sh | sh
 ```
 
 This installs the latest release to `~/.local/bin`. Set `INSTALL_DIR` to override the destination, or `VERSION` to pin a specific release tag.

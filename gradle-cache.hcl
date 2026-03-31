@@ -29,7 +29,7 @@ channel "latest" {
   version = "*"
 
   auto-version {
-    github-release        = "joshfriend/bundle-cache"
+    github-release        = "block/bundle-cache"
     version-pattern       = "v(.*)"
   }
 }
