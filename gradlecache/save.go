@@ -508,18 +508,18 @@ func createTarPzstd(ctx context.Context, w io.Writer, tarArgs []string, pzstdPat
 	pzstdCmd.Stderr = &pzstdStderr
 
 	if err := tarCmd.Start(); err != nil {
-		pr.Close() //nolint:errcheck,gosec
-		pw.Close() //nolint:errcheck,gosec
+		_ = pr.Close()
+		_ = pw.Close()
 		return errors.Wrap(err, "start tar")
 	}
-	pw.Close() // parent no longer needs write end //nolint:errcheck,gosec
+	_ = pw.Close() // parent no longer needs write end
 
 	if err := pzstdCmd.Start(); err != nil {
 		pr.Close()    //nolint:errcheck,gosec
 		tarCmd.Wait() //nolint:errcheck,gosec
 		return errors.Wrap(err, "start pzstd")
 	}
-	pr.Close() // parent no longer needs read end //nolint:errcheck,gosec
+	_ = pr.Close() // parent no longer needs read end
 
 	pzstdWaitErr := pzstdCmd.Wait()
 	tarWaitErr := tarCmd.Wait()
@@ -706,7 +706,7 @@ func CollectNewFiles(realCaches string, since time.Time, gradleHome string) ([]s
 			childRel := rel + "/" + entry.Name()
 
 			hasNew := false
-			filepath.WalkDir(childDir, func(_ string, d os.DirEntry, err error) error {
+			_ = filepath.WalkDir(childDir, func(_ string, d os.DirEntry, err error) error {
 				if err != nil || d.IsDir() {
 					return nil
 				}

@@ -648,7 +648,7 @@ func extractBundleZstdMultiFrame(ctx context.Context, br *bufio.Reader, dlTiming
 		if firstErr != nil {
 			pw.CloseWithError(firstErr)
 		} else {
-			pw.Close()
+			_ = pw.Close()
 		}
 		consumerDone <- firstErr
 	}()
@@ -739,7 +739,7 @@ func extractBundleZstdMultiFrame(ctx context.Context, br *bufio.Reader, dlTiming
 		return filepath.Join(defaultDir, name)
 	}
 	extractErr := extractTarPlatformRouted(decTiming, targetFn, skipExisting)
-	pr.Close()
+	_ = pr.Close()
 	cancel()
 
 	consumerErr := <-consumerDone

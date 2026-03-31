@@ -198,7 +198,7 @@ func main() {
 		}
 		defer func() {
 			pprof.StopCPUProfile()
-			f.Close()
+			_ = f.Close()
 			slog.Info("CPU profile written", "path", cli.CPUProfile)
 		}()
 	}
