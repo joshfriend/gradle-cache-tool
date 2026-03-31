@@ -80,7 +80,7 @@ func (c *s3Client) stat(ctx context.Context, bucket, key string) (s3ObjInfo, err
 	io.Copy(io.Discard, resp.Body) //nolint:errcheck,gosec
 	resp.Body.Close()              //nolint:errcheck,gosec
 	if resp.StatusCode != http.StatusOK {
-		return s3ObjInfo{}, errors.Errorf("s3 HEAD %s/%s: status %d", bucket, key, resp.StatusCode)
+		return s3ObjInfo{}, errors.Errorf("status %d", resp.StatusCode)
 	}
 	return s3ObjInfo{
 		Size: resp.ContentLength,
@@ -102,7 +102,7 @@ func (c *s3Client) get(ctx context.Context, bucket, key string, info s3ObjInfo) 
 		if resp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 			resp.Body.Close() //nolint:errcheck,gosec
-			return nil, errors.Errorf("s3 GET %s/%s: status %d: %s", bucket, key, resp.StatusCode, body)
+			return nil, errors.Errorf("s3 GET: status %d: %s", resp.StatusCode, body)
 		}
 		return resp.Body, nil
 	}
