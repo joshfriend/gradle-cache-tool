@@ -1,4 +1,4 @@
-# gradle-cache
+# Bundle Cache Tool
 
 A CLI tool for saving and restoring Gradle build cache bundles, with a ready-to-use GitHub Action.
 
@@ -30,7 +30,7 @@ jobs:
         with:
           fetch-depth: 0  # full history needed for cache lookup
 
-      - uses: joshfriend/gradle-cache-tool@v1  # restores cache here
+      - uses: joshfriend/bundle-cache@v1  # restores cache here
 
       - run: ./gradlew assembleDebug            # your build
 
