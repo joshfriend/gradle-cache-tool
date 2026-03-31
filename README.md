@@ -3,11 +3,13 @@
 A CLI tool for saving and restoring Gradle build cache bundles, with a ready-to-use GitHub Action.
 
 Bundles are stored keyed by commit SHA, so `restore` doesn't need to know
-exactly which commit produced a given bundle. Instead, it walks the local git
-history from a given ref (default: `HEAD`) and tries each commit SHA in order,
-newest first, until it finds a bundle that exists. This means a developer
-on a feature branch will automatically get the bundle from the most recent
-main-branch commit that has one, without needing to know its SHA in advance.
+exactly which commit produced a given bundle. Instead, it walks local git
+history and tries each commit SHA in order, newest first, until it finds a
+bundle that exists. By default it walks from a given ref (default: `HEAD`);
+when restoring for a branch or pull request, it first resolves the merge-base
+of `HEAD` and the base ref, then walks from that common ancestor. This lets a
+feature branch restore a bundle compatible with its base without needing to
+know the SHA in advance.
 
 The history walk counts distinct author-change boundaries rather than raw
 commit count, so a long run of commits by the same author only consumes one
@@ -50,17 +52,18 @@ separate save step. It runs even if your build fails, so partial caches are
 still preserved for the next run.
 
 On **pull requests**, the action automatically uses delta caches: it restores
-the base bundle from the default branch, applies any existing branch delta on
-top, and after the build only saves the files that changed. On **pushes to
-the default branch**, it saves a full bundle. This is all auto-detected from
-the GitHub event context — no configuration needed.
+the base bundle by walking history from the **merge-base** of the PR branch and
+the default branch, applies any existing branch delta on top, and after the
+build only saves the files that changed. On **pushes to the default branch**,
+it saves a full bundle. This is all auto-detected from the GitHub event context
+— no configuration needed.
 
 ### Inputs
 
 | Input | Default | Description |
 |-------|---------|-------------|
 | `cache-key` | `github.job` | Cache key identifying the bundle. Each job gets its own cache by default. |
-| `ref` | repo default branch | Git ref for the history walk when searching for a base bundle. |
+| `ref` | repo default branch | Git ref used to search for a base bundle. On PR restores, history walks from the merge-base of `HEAD` and this ref. |
 | `branch` | auto-detected on PRs | Branch name for delta cache support. |
 | `project-dir` | `.` | Path to the Gradle project root. |
 | `gradle-user-home` | `~/.gradle` | Path to GRADLE_USER_HOME. |

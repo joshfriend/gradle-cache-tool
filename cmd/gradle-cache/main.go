@@ -66,7 +66,7 @@ type RestoreCmd struct {
 	backendFlags
 	CacheKey       string   `help:"Bundle identifier, e.g. 'my-project:assembleRelease'." required:""`
 	GitDir         string   `help:"Path to the git repository used for history walking." default:"." type:"path"`
-	Ref            string   `help:"Git ref to start the history walk from." default:"HEAD"`
+	Ref            string   `help:"Git ref used to search for a base bundle. When --branch is set, history walks from the merge-base of HEAD and this ref." default:"HEAD"`
 	Commit         string   `help:"Specific commit SHA to try directly, skipping history walk."`
 	MaxBlocks      int      `help:"Number of distinct-author commit blocks to search." default:"20"`
 	GradleUserHome string   `help:"Path to GRADLE_USER_HOME." env:"GRADLE_USER_HOME"`

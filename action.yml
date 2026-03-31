@@ -25,8 +25,9 @@ inputs:
     default: us-west-2
   ref:
     description: >
-      Git ref to start the history walk from when searching for a base bundle.
-      Defaults to the repository's default branch.
+      Git ref used to search for a base bundle. On pull_request restores, the
+      tool walks history from the merge-base of this ref and HEAD. Defaults to
+      the repository's default branch.
     required: false
   branch:
     description: >

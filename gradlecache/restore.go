@@ -208,7 +208,8 @@ type RestoreConfig struct {
 	CacheKey string
 	// GitDir is the path to the git repository for history walking. Defaults to ".".
 	GitDir string
-	// Ref is the git ref to start the history walk from. Defaults to "HEAD".
+	// Ref is the git ref used to search for a base bundle. When Branch is set,
+	// history walks from the merge-base of HEAD and Ref. Defaults to "HEAD".
 	Ref string
 	// Commit is a specific commit SHA to try directly, skipping history walk.
 	Commit string
@@ -307,7 +308,18 @@ func Restore(ctx context.Context, cfg RestoreConfig) error {
 	if cfg.Commit != "" {
 		commits = []string{cfg.Commit}
 	} else {
-		commits, err = historyCommits(ctx, cfg.GitDir, cfg.Ref, cfg.MaxBlocks)
+		ref := cfg.Ref
+		// When restoring on a branch (PR), resolve the merge-base between HEAD
+		// and the base ref so we walk history from the common ancestor rather
+		// than the tip of the default branch.
+		if cfg.Branch != "" && ref != "HEAD" {
+			mb, err := mergeBase(ctx, cfg.GitDir, ref, "HEAD")
+			if err == nil {
+				log.Debug("resolved merge-base", "base", ref, "merge_base", mb[:min(8, len(mb))])
+				ref = mb
+			}
+		}
+		commits, err = historyCommits(ctx, cfg.GitDir, ref, cfg.MaxBlocks)
 		if err != nil {
 			return errors.Wrap(err, "walk git history")
 		}
