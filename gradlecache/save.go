@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -124,6 +125,7 @@ type SaveConfig struct {
 	GitDir         string
 	GradleUserHome string
 	IncludedBuilds []string
+	SkipWarm       bool // skip page cache warming (for benchmarking cold baseline)
 	Metrics        MetricsClient
 	Logger         *slog.Logger
 }
@@ -194,6 +196,16 @@ func Save(ctx context.Context, cfg SaveConfig) error {
 	pr, pw := io.Pipe()
 
 	log.Info("saving bundle", "commit", cfg.Commit[:min(8, len(cfg.Commit))], "cache-key", cfg.CacheKey)
+
+	if !cfg.SkipWarm {
+		log.Debug("warming page cache")
+		warmStart := time.Now()
+		warmPageCache(sources)
+		log.Debug("page cache warm", "duration", time.Since(warmStart).Round(time.Millisecond))
+	} else {
+		log.Debug("skipping page cache warm (SkipWarm=true)")
+	}
+
 	saveStart := time.Now()
 
 	// Wrap the archive→upload boundary to measure upload wait time.
@@ -507,6 +519,40 @@ func matchesAny(name string, patterns []string) bool {
 		}
 	}
 	return false
+}
+
+// warmPageCache reads every regular file under each TarSource in parallel,
+// faulting pages into the OS page cache before tar reads them sequentially.
+// On cold NVMe storage with many small files (e.g. 200K Gradle cache entries),
+// tar is limited to ~80 MB/s by per-file IOPS overhead. Warming the cache with
+// parallel readers saturates IOPS up front so that tar subsequently reads at
+// memory speed (~1300 MB/s).
+func warmPageCache(sources []TarSource) {
+	concurrency := min(runtime.GOMAXPROCS(0)*2, 32)
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+
+	for _, src := range sources {
+		root := filepath.Join(src.BaseDir, src.Path)
+		_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+			if err != nil || !d.Type().IsRegular() {
+				return nil
+			}
+			sem <- struct{}{}
+			wg.Add(1)
+			go func() {
+				defer func() { <-sem; wg.Done() }()
+				f, err := os.Open(path)
+				if err != nil {
+					return
+				}
+				_, _ = io.Copy(io.Discard, f)
+				_ = f.Close()
+			}()
+			return nil
+		})
+	}
+	wg.Wait()
 }
 
 // CreateTarZstd creates a zstd-compressed tar archive from the given sources.
