@@ -483,13 +483,10 @@ func Restore(ctx context.Context, cfg RestoreConfig) error {
 		cfg.Metrics.Distribution("gradle_cache.restore_base.speed_mbps", mbps, "cache_key:"+cfg.CacheKey)
 	}
 
-	if err := touchMarkerFile(filepath.Join(cfg.GradleUserHome, ".cache-restore-marker")); err != nil {
-		log.Warn("could not write restore marker", "err", err)
-	}
-
-	// ── Apply delta bundle (sequentially, after base + marker) ──────────
-	// Extracted after the marker so delta files get mtime > marker and are
-	// recaptured into the next delta save, enabling accumulation across builds.
+	// ── Apply delta bundle (if Branch was given) ─────────────────────────
+	// Delta must be applied BEFORE the marker is written so that delta-
+	// restored files have mtime before the marker and are correctly excluded
+	// from the next delta save by CollectNewFiles.
 	if deltaCh != nil {
 		dr := <-deltaCh
 		if dr.err != nil {
@@ -524,6 +521,10 @@ func Restore(ctx context.Context, cfg RestoreConfig) error {
 					"cache_key:"+cfg.CacheKey)
 			}
 		}
+	}
+
+	if err := touchMarkerFile(filepath.Join(cfg.GradleUserHome, ".cache-restore-marker")); err != nil {
+		log.Warn("could not write restore marker", "err", err)
 	}
 
 	restoreTotal := time.Since(findStart)

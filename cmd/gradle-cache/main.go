@@ -30,6 +30,7 @@ type CLI struct {
 	RestoreDelta  RestoreDeltaCmd  `cmd:"" help:"Apply a branch delta bundle on top of an already-restored base cache."`
 	Save          SaveCmd          `cmd:"" help:"Bundle GRADLE_USER_HOME/caches and upload to S3 tagged with a commit SHA."`
 	SaveDelta     SaveDeltaCmd     `cmd:"" help:"Pack files added since the last restore and upload as a branch delta bundle."`
+	Trim          TrimCmd          `cmd:"" help:"Remove restored cache entries that were never accessed during the build (requires relatime)."`
 	StatsdAddr    string           `help:"DogStatsD address (host:port) for emitting metrics. Auto-detected from DD_AGENT_HOST if not set."`
 	DatadogAPIKey string           `help:"DataDog API key for direct metric submission (no agent required)." env:"DATADOG_API_KEY"`
 	MetricsTags   []string         `help:"Additional metric tags in key:value format. May be repeated." name:"metrics-tag"`
@@ -226,6 +227,20 @@ func (c *SaveDeltaCmd) Run(ctx context.Context, metrics gradlecache.MetricsClien
 		GradleUserHome: c.GradleUserHome,
 		ProjectDir:     c.ProjectDir,
 		IncludedBuilds: c.IncludedBuilds,
+		Metrics:        metrics,
+	})
+}
+
+// ── Trim ────────────────────────────────────────────────────────────────────
+
+type TrimCmd struct {
+	GradleUserHome string `help:"Path to GRADLE_USER_HOME." env:"GRADLE_USER_HOME" type:"path"`
+}
+
+func (c *TrimCmd) Run(metrics gradlecache.MetricsClient) error {
+	slog.Debug(gradleUserHomeEnv, "path", c.GradleUserHome)
+	return gradlecache.TrimRestoredFiles(gradlecache.TrimConfig{
+		GradleUserHome: c.GradleUserHome,
 		Metrics:        metrics,
 	})
 }

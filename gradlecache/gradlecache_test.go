@@ -79,6 +79,35 @@ func TestIsDeltaExcluded(t *testing.T) {
 	}
 }
 
+// TestExtractPreservesMtime verifies that extracted files retain their original
+// mtime from the tar archive header.
+func TestExtractPreservesMtime(t *testing.T) {
+	// Create a tar with a known mtime.
+	var buf bytes.Buffer
+	tw := archive_tar.NewWriter(&buf)
+	targetTime := time.Date(2025, 6, 15, 12, 0, 0, 0, time.UTC)
+	content := []byte("hello world")
+	must(t, tw.WriteHeader(&archive_tar.Header{
+		Name:     "test/file.txt",
+		Size:     int64(len(content)),
+		Mode:     0o644,
+		ModTime:  targetTime,
+		Typeflag: archive_tar.TypeReg,
+	}))
+	_, err := tw.Write(content)
+	must(t, err)
+	must(t, tw.Close())
+
+	dir := t.TempDir()
+	must(t, extractTarPlatform(bytes.NewReader(buf.Bytes()), dir))
+
+	fi, err := os.Stat(filepath.Join(dir, "test", "file.txt"))
+	must(t, err)
+	if !fi.ModTime().Equal(targetTime) {
+		t.Errorf("mtime not preserved: got %v, want %v", fi.ModTime(), targetTime)
+	}
+}
+
 // TestCollectNewFilesWorkspaceCompleteness verifies that CollectNewFiles
 // includes ALL files from an immutable workspace when any file is new.
 func TestCollectNewFilesWorkspaceCompleteness(t *testing.T) {

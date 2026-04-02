@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/alecthomas/errors"
 	"golang.org/x/sync/errgroup"
@@ -28,6 +29,11 @@ func (c *concurrentDirCache) ensure(d string, mode os.FileMode) error {
 	c.m.Store(d, struct{}{})
 	return nil
 }
+
+// epoch is the zero time used as atime when restoring files. On filesystems
+// with relatime, any subsequent read updates atime to the current time,
+// letting us distinguish "read during the build" from "never accessed".
+var epoch = time.Unix(0, 0)
 
 const (
 	// maxBufferedFileSize is the threshold below which files are buffered in
@@ -63,6 +69,7 @@ type largeWriteJob struct {
 	target       string
 	mode         os.FileMode
 	expectedSize int64
+	modTime      time.Time
 	chunks       chan *[]byte // closed by reader when all chunks are dispatched
 }
 
@@ -81,9 +88,10 @@ func extractTarPlatformRouted(r io.Reader, targetFn func(string) string, skipExi
 }
 
 type writeJob struct {
-	target string
-	mode   os.FileMode
-	data   []byte
+	target  string
+	mode    os.FileMode
+	data    []byte
+	modTime time.Time
 }
 
 func extractTarParallelRouted(r io.Reader, targetFn func(string) string, skipExisting bool) error {
@@ -114,6 +122,11 @@ func extractTarParallelRouted(r io.Reader, targetFn func(string) string, skipExi
 				}
 				if err := f.Close(); err != nil {
 					return errors.Errorf("close %s: %w", filepath.Base(job.target), err)
+				}
+				if !job.modTime.IsZero() {
+					// Set atime to epoch so atime-based trim can detect
+					// files that were never read during the build.
+					_ = os.Chtimes(job.target, epoch, job.modTime)
 				}
 			}
 			return nil
@@ -161,6 +174,9 @@ func extractTarParallelRouted(r io.Reader, targetFn func(string) string, skipExi
 				}
 				if writeErr != nil {
 					return writeErr
+				}
+				if !job.modTime.IsZero() {
+					_ = os.Chtimes(job.target, epoch, job.modTime)
 				}
 			}
 			return nil
@@ -250,7 +266,7 @@ func processEntry(
 			// falls behind on disk writes).
 			chunks := make(chan *[]byte, largeChunkCap)
 			select {
-			case largeJobs <- largeWriteJob{target: target, mode: hdr.FileInfo().Mode(), expectedSize: hdr.Size, chunks: chunks}:
+			case largeJobs <- largeWriteJob{target: target, mode: hdr.FileInfo().Mode(), expectedSize: hdr.Size, modTime: hdr.ModTime, chunks: chunks}:
 			case <-ctx.Done():
 				return errors.Wrap(ctx.Err(), "context cancelled waiting for large-file worker")
 			}
@@ -286,7 +302,7 @@ func processEntry(
 			return errors.Errorf("read %s: %w", hdr.Name, err)
 		}
 		select {
-		case jobs <- writeJob{target: target, mode: hdr.FileInfo().Mode(), data: buf}:
+		case jobs <- writeJob{target: target, mode: hdr.FileInfo().Mode(), data: buf, modTime: hdr.ModTime}:
 		case <-ctx.Done():
 			return errors.Wrap(ctx.Err(), "context cancelled dispatching small-file job")
 		}
