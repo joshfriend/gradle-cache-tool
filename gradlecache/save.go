@@ -45,6 +45,12 @@ func (c *RestoreDeltaConfig) defaults() {
 		home, _ := os.UserHomeDir()
 		c.GradleUserHome = filepath.Join(home, ".gradle")
 	}
+	if c.ProjectDir == "" {
+		wd, err := os.Getwd()
+		if err == nil {
+			c.ProjectDir = wd
+		}
+	}
 	if c.Metrics == nil {
 		c.Metrics = NoopMetrics{}
 	}
@@ -189,6 +195,9 @@ func Save(ctx context.Context, cfg SaveConfig) error {
 	if err != nil {
 		return errors.Wrap(err, "get working directory")
 	}
+	if err := validateProjectDir(projectDir); err != nil {
+		return err
+	}
 	sources := []TarSource{{BaseDir: cfg.GradleUserHome, Path: "./caches"}}
 	if fi, err := os.Stat(filepath.Join(cfg.GradleUserHome, "wrapper")); err == nil && fi.IsDir() {
 		sources = append(sources, TarSource{BaseDir: cfg.GradleUserHome, Path: "./wrapper"})
@@ -287,6 +296,12 @@ func (c *SaveDeltaConfig) defaults() {
 		home, _ := os.UserHomeDir()
 		c.GradleUserHome = filepath.Join(home, ".gradle")
 	}
+	if c.ProjectDir == "" {
+		wd, err := os.Getwd()
+		if err == nil {
+			c.ProjectDir = wd
+		}
+	}
 	if c.Metrics == nil {
 		c.Metrics = NoopMetrics{}
 	}
@@ -301,10 +316,15 @@ func SaveDelta(ctx context.Context, cfg SaveDeltaConfig) error {
 	cfg.defaults()
 	log := cfg.Logger
 
+	if err := validateProjectDir(cfg.ProjectDir); err != nil {
+		return err
+	}
+
 	markerPath := filepath.Join(cfg.GradleUserHome, ".cache-restore-marker")
 	markerInfo, err := os.Stat(markerPath)
 	if err != nil {
-		return errors.Errorf("restore marker not found at %s — run restore first: %w", markerPath, err)
+		log.Info("no restore marker found, skipping delta save (no base restore was performed)")
+		return nil
 	}
 	since := markerInfo.ModTime()
 	log.Debug("scanning for new cache files", "since", since.Format(time.RFC3339Nano))
@@ -1023,6 +1043,21 @@ func ProjectDirSources(projectDir string, includedBuilds []string) []TarSource {
 	}
 
 	return sources
+}
+
+func validateProjectDir(projectDir string) error {
+	if projectDir == "" {
+		return errors.New("project directory is required")
+	}
+	dotGradle := filepath.Join(projectDir, ".gradle")
+	info, err := os.Stat(dotGradle)
+	if err != nil {
+		return errors.Errorf("project directory %q is missing .gradle/: %w", projectDir, err)
+	}
+	if !info.IsDir() {
+		return errors.Errorf("project directory %q has non-directory .gradle path", projectDir)
+	}
+	return nil
 }
 
 // ConventionBuildDirs returns the relative paths of included build output directories.
