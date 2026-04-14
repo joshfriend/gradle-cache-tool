@@ -251,6 +251,9 @@ func processEntry(
 				if err != nil {
 					largeChunkPool.Put(buf)
 					close(chunks)
+					// Remove the partially-written file so a truncated
+					// bundle doesn't leave corrupt artifacts on disk.
+					os.Remove(target) //nolint:errcheck
 					return errors.Errorf("read %s: %w", hdr.Name, err)
 				}
 				*buf = (*buf)[:n]

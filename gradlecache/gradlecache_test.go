@@ -5,6 +5,7 @@ import (
 	archive_tar "archive/tar"
 	"bytes"
 	"context"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -483,6 +484,72 @@ func TestExtractZstdDrainsBufferedReaderToEOF(t *testing.T) {
 		}
 		if _, err := os.Stat(filepath.Join(dstDir, "caches", "entry.bin")); err != nil {
 			t.Fatalf("expected extracted file: %v", err)
+		}
+	})
+}
+
+// ─── Truncated archive test ──────────────────────────────────────────────────
+
+// TestExtractBundleTruncatedArchive verifies that extractBundleZstd returns an
+// io.ErrUnexpectedEOF when the archive is truncated, and that no partially
+// written files are left on disk.
+func TestExtractBundleTruncatedArchive(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("small files", func(t *testing.T) {
+		srcDir := t.TempDir()
+		must(t, os.MkdirAll(filepath.Join(srcDir, "caches"), 0o755))
+		must(t, os.WriteFile(filepath.Join(srcDir, "caches", "first.jar"), bytes.Repeat([]byte("A"), 4096), 0o644))
+		must(t, os.WriteFile(filepath.Join(srcDir, "caches", "second.jar"), bytes.Repeat([]byte("B"), 4096), 0o644))
+
+		var archive bytes.Buffer
+		must(t, CreateDeltaTarZstd(ctx, &archive, srcDir, []string{"caches/first.jar", "caches/second.jar"}))
+
+		truncated := archive.Bytes()[:archive.Len()*60/100]
+		gradleHome := t.TempDir()
+		projectDir := t.TempDir()
+
+		_, err := extractBundleZstd(ctx, bytes.NewReader(truncated), []extractRule{
+			{prefix: "caches/", baseDir: gradleHome},
+		}, projectDir, false)
+
+		if err == nil {
+			t.Fatal("expected an error from truncated archive, got nil")
+		}
+		if !stderrors.Is(err, io.ErrUnexpectedEOF) {
+			t.Fatalf("expected io.ErrUnexpectedEOF in error chain, got: %v", err)
+		}
+	})
+
+	t.Run("large file no partial artifact", func(t *testing.T) {
+		srcDir := t.TempDir()
+		must(t, os.MkdirAll(filepath.Join(srcDir, "caches"), 0o755))
+		// 5 MB file — larger than maxBufferedFileSize so it takes the
+		// streaming large-file path.
+		must(t, os.WriteFile(filepath.Join(srcDir, "caches", "big.jar"), bytes.Repeat([]byte("X"), 5<<20), 0o644))
+
+		var archive bytes.Buffer
+		must(t, CreateDeltaTarZstd(ctx, &archive, srcDir, []string{"caches/big.jar"}))
+
+		// Truncate at ~60% so the large-file read fails mid-stream.
+		truncated := archive.Bytes()[:archive.Len()*60/100]
+		gradleHome := t.TempDir()
+		projectDir := t.TempDir()
+
+		_, err := extractBundleZstd(ctx, bytes.NewReader(truncated), []extractRule{
+			{prefix: "caches/", baseDir: gradleHome},
+		}, projectDir, false)
+
+		if err == nil {
+			t.Fatal("expected an error from truncated archive, got nil")
+		}
+		if !stderrors.Is(err, io.ErrUnexpectedEOF) {
+			t.Fatalf("expected io.ErrUnexpectedEOF in error chain, got: %v", err)
+		}
+
+		// The partially-written large file must not remain on disk.
+		if _, statErr := os.Stat(filepath.Join(gradleHome, "caches", "big.jar")); statErr == nil {
+			t.Fatal("partially-written big.jar should have been removed")
 		}
 	})
 }

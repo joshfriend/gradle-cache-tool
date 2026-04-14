@@ -436,7 +436,15 @@ func Restore(ctx context.Context, cfg RestoreConfig) error {
 	netTiming := &timingReader{r: cb}
 	ps, err := extractBundleZstd(ctx, netTiming, rules, cfg.ProjectDir, !gradleUserHomeEmpty)
 	if err != nil {
-		return errors.Wrap(err, "extract bundle")
+		// A truncated tar archive (e.g. from a crash during upload) produces an
+		// unexpected EOF during extraction. Treat this as a warning rather than
+		// a fatal error: the files extracted before the truncation point are
+		// still usable and better than no cache at all.
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			log.Warn("bundle appears truncated! using partially extracted cache", "err", err)
+		} else {
+			return errors.Wrap(err, "extract bundle")
+		}
 	}
 
 	totalElapsed := time.Since(dlStart)
