@@ -1045,13 +1045,12 @@ func validateProjectDir(projectDir string) error {
 	if projectDir == "" {
 		return errors.New("project directory is required")
 	}
-	dotGradle := filepath.Join(projectDir, ".gradle")
-	info, err := os.Stat(dotGradle)
+	info, err := os.Stat(projectDir)
 	if err != nil {
-		return errors.Errorf("project directory %q is missing .gradle/: %w", projectDir, err)
+		return errors.Errorf("project directory %q does not exist: %w", projectDir, err)
 	}
 	if !info.IsDir() {
-		return errors.Errorf("project directory %q has non-directory .gradle path", projectDir)
+		return errors.Errorf("project directory %q is not a directory", projectDir)
 	}
 	return nil
 }

@@ -862,25 +862,24 @@ func TestSaveDeltaDefaultsProjectDirToWorkingDirectory(t *testing.T) {
 	}
 }
 
-func TestSaveDeltaErrorsWhenProjectDirHasNoDotGradle(t *testing.T) {
+func TestSaveDeltaErrorsWhenProjectDirDoesNotExist(t *testing.T) {
 	ctx := context.Background()
 	gradleHome := t.TempDir()
 	must(t, os.MkdirAll(filepath.Join(gradleHome, "caches"), 0o755))
 	must(t, touchMarkerFile(filepath.Join(gradleHome, ".cache-restore-marker")))
 
-	projectDir := t.TempDir()
 	err := SaveDelta(ctx, SaveDeltaConfig{
 		CachewURL:      "http://example.invalid",
 		CacheKey:       "test-cache",
 		Branch:         "feature/test",
 		GradleUserHome: gradleHome,
-		ProjectDir:     projectDir,
+		ProjectDir:     filepath.Join(t.TempDir(), "does-not-exist"),
 	})
 	if err == nil {
-		t.Fatal("expected SaveDelta to fail when project dir has no .gradle directory")
+		t.Fatal("expected SaveDelta to fail when project dir does not exist")
 	}
-	if !strings.Contains(err.Error(), "missing .gradle/") {
-		t.Fatalf("expected missing .gradle error, got %v", err)
+	if !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("expected 'does not exist' error, got %v", err)
 	}
 }
 
@@ -926,31 +925,24 @@ func TestSaveDeltaReturnsMarkerStatErrors(t *testing.T) {
 	}
 }
 
-func TestSaveErrorsWhenWorkingDirectoryHasNoDotGradle(t *testing.T) {
+func TestSaveErrorsWhenProjectDirDoesNotExist(t *testing.T) {
 	ctx := context.Background()
 	gradleHome := t.TempDir()
 	must(t, os.MkdirAll(filepath.Join(gradleHome, "caches"), 0o755))
 
-	projectDir := t.TempDir()
-	origWD, err := os.Getwd()
-	must(t, err)
-	must(t, os.Chdir(projectDir))
-	defer func() {
-		must(t, os.Chdir(origWD))
-	}()
-
-	err = Save(ctx, SaveConfig{
+	err := Save(ctx, SaveConfig{
 		CachewURL:      "http://example.invalid",
 		CacheKey:       "test-cache",
 		Commit:         strings.Repeat("a", 40),
 		GradleUserHome: gradleHome,
+		ProjectDir:     filepath.Join(t.TempDir(), "does-not-exist"),
 		SkipWarm:       true,
 	})
 	if err == nil {
-		t.Fatal("expected Save to fail when working directory has no .gradle directory")
+		t.Fatal("expected Save to fail when project dir does not exist")
 	}
-	if !strings.Contains(err.Error(), "missing .gradle/") {
-		t.Fatalf("expected missing .gradle error, got %v", err)
+	if !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("expected 'does not exist' error, got %v", err)
 	}
 }
 
