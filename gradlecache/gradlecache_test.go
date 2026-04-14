@@ -817,6 +817,48 @@ func TestSaveDeltaErrorsWhenProjectDirHasNoDotGradle(t *testing.T) {
 	}
 }
 
+func TestSaveDeltaSkipsColdStartBeforeProjectDirValidation(t *testing.T) {
+	ctx := context.Background()
+	gradleHome := t.TempDir()
+	must(t, os.MkdirAll(filepath.Join(gradleHome, "caches"), 0o755))
+
+	projectDir := t.TempDir()
+	err := SaveDelta(ctx, SaveDeltaConfig{
+		CachewURL:      "http://example.invalid",
+		CacheKey:       "test-cache",
+		Branch:         "feature/test",
+		GradleUserHome: gradleHome,
+		ProjectDir:     projectDir,
+	})
+	if err != nil {
+		t.Fatalf("expected cold-start SaveDelta to skip without validating project dir, got %v", err)
+	}
+}
+
+func TestSaveDeltaReturnsMarkerStatErrors(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	gradleHome := filepath.Join(root, "gradle-home-file")
+	must(t, os.WriteFile(gradleHome, []byte("not a directory"), 0o644))
+
+	projectDir := t.TempDir()
+	must(t, os.MkdirAll(filepath.Join(projectDir, ".gradle"), 0o755))
+
+	err := SaveDelta(ctx, SaveDeltaConfig{
+		CachewURL:      "http://example.invalid",
+		CacheKey:       "test-cache",
+		Branch:         "feature/test",
+		GradleUserHome: gradleHome,
+		ProjectDir:     projectDir,
+	})
+	if err == nil {
+		t.Fatal("expected SaveDelta to return non-not-exist restore marker stat errors")
+	}
+	if !strings.Contains(err.Error(), "stat restore marker") {
+		t.Fatalf("expected restore marker stat error, got %v", err)
+	}
+}
+
 func TestSaveErrorsWhenWorkingDirectoryHasNoDotGradle(t *testing.T) {
 	ctx := context.Background()
 	gradleHome := t.TempDir()

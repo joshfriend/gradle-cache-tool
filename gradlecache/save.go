@@ -316,15 +316,17 @@ func SaveDelta(ctx context.Context, cfg SaveDeltaConfig) error {
 	cfg.defaults()
 	log := cfg.Logger
 
-	if err := validateProjectDir(cfg.ProjectDir); err != nil {
-		return err
-	}
-
 	markerPath := filepath.Join(cfg.GradleUserHome, ".cache-restore-marker")
 	markerInfo, err := os.Stat(markerPath)
 	if err != nil {
-		log.Info("no restore marker found, skipping delta save (no base restore was performed)")
-		return nil
+		if os.IsNotExist(err) {
+			log.Info("no restore marker found, skipping delta save (no base restore was performed)")
+			return nil
+		}
+		return errors.Wrap(err, "stat restore marker")
+	}
+	if err := validateProjectDir(cfg.ProjectDir); err != nil {
+		return err
 	}
 	since := markerInfo.ModTime()
 	log.Debug("scanning for new cache files", "since", since.Format(time.RFC3339Nano))
