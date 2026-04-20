@@ -34,6 +34,7 @@ type CLI struct {
 	DatadogAPIKey string           `help:"DataDog API key for direct metric submission (no agent required)." env:"DATADOG_API_KEY"`
 	MetricsTags   []string         `help:"Additional metric tags in key:value format. May be repeated." name:"metrics-tag"`
 	CPUProfile    string           `help:"Write CPU profile to file." name:"cpuprofile" hidden:"" type:"path"`
+	DDLogFile     string           `help:"Path to a log file tailed by the Datadog Agent for telemetry events." name:"dd-log-file" env:"DD_LOG_PATH"`
 }
 
 type backendFlags struct {
@@ -266,6 +267,7 @@ func main() {
 		StatsdAddr:    cli.StatsdAddr,
 		DatadogAPIKey: cli.DatadogAPIKey,
 		MetricsTags:   cli.MetricsTags,
+		DDLogPath:     cli.DDLogFile,
 	}
 	metrics := mf.NewMetricsClient()
 	defer metrics.Close()

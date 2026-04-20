@@ -30,6 +30,7 @@ type MetricsFlags struct {
 	StatsdAddr    string
 	DatadogAPIKey string
 	MetricsTags   []string
+	DDLogPath     string // optional: path to a file tailed by the DD agent for log-based metrics
 }
 
 // DetectStatsdAddr returns the DogStatsD address from the environment, or empty
@@ -47,27 +48,42 @@ func DetectStatsdAddr() string {
 }
 
 // NewMetricsClient returns a MetricsClient based on the configured flags.
+// When DDLogPath is set, each metric is also written as a JSON log line to
+// that file for collection by the Datadog Agent.
 func (f *MetricsFlags) NewMetricsClient() MetricsClient {
+	var client MetricsClient
 	if f.StatsdAddr != "" {
 		if c := NewStatsdClient(f.StatsdAddr, f.MetricsTags); c != nil {
 			slog.Debug("metrics: using DogStatsD", "addr", f.StatsdAddr)
-			return c
+			client = c
+		} else {
+			slog.Warn("failed to connect to DogStatsD, metrics disabled", "addr", f.StatsdAddr)
+			client = NoopMetrics{}
 		}
-		slog.Warn("failed to connect to DogStatsD, metrics disabled", "addr", f.StatsdAddr)
-		return NoopMetrics{}
-	}
-	if f.DatadogAPIKey != "" {
+	} else if f.DatadogAPIKey != "" {
 		slog.Debug("metrics: using Datadog HTTP API")
-		return NewDatadogAPIClient(f.DatadogAPIKey, f.MetricsTags)
-	}
-	if addr := DetectStatsdAddr(); addr != "" {
+		client = NewDatadogAPIClient(f.DatadogAPIKey, f.MetricsTags)
+	} else if addr := DetectStatsdAddr(); addr != "" {
 		if c := NewStatsdClient(addr, f.MetricsTags); c != nil {
 			slog.Debug("metrics: auto-detected DogStatsD agent", "addr", addr)
-			return c
+			client = c
 		}
 	}
-	slog.Debug("metrics: no backend configured, metrics disabled")
-	return NoopMetrics{}
+	if client == nil {
+		slog.Debug("metrics: no backend configured, metrics disabled")
+		client = NoopMetrics{}
+	}
+
+	if f.DDLogPath != "" {
+		lm, err := newLoggedMetrics(client, f.DDLogPath)
+		if err != nil {
+			slog.Warn("failed to open DD log file, log-based metrics disabled", "path", f.DDLogPath, "error", err)
+			return client
+		}
+		slog.Debug("metrics: also logging to DD agent file", "path", f.DDLogPath)
+		return lm
+	}
+	return client
 }
 
 // ── DogStatsD (UDP) ─────────────────────────────────────────────────────────
