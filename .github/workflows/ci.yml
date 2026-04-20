@@ -15,7 +15,7 @@ jobs:
       - name: Activate Hermit
         run: echo "${GITHUB_WORKSPACE}/bin" >> "$GITHUB_PATH"
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/go/pkg/mod
@@ -42,7 +42,7 @@ jobs:
       - name: Activate Hermit
         run: echo "${GITHUB_WORKSPACE}/bin" >> "$GITHUB_PATH"
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/go/pkg/mod
@@ -66,7 +66,7 @@ jobs:
       - name: Activate Hermit
         run: echo "${GITHUB_WORKSPACE}/bin" >> "$GITHUB_PATH"
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/go/pkg/mod
@@ -121,7 +121,7 @@ jobs:
       - name: Activate Hermit
         run: echo "${GITHUB_WORKSPACE}/bin" >> "$GITHUB_PATH"
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/go/pkg/mod
@@ -184,7 +184,7 @@ jobs:
       - name: Activate Hermit
         run: echo "${GITHUB_WORKSPACE}/bin" >> "$GITHUB_PATH"
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/go/pkg/mod
@@ -238,7 +238,7 @@ jobs:
       - name: Activate Hermit
         run: echo "${GITHUB_WORKSPACE}/bin" >> "$GITHUB_PATH"
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/go/pkg/mod
