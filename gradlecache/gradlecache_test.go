@@ -59,6 +59,8 @@ func TestIsDeltaExcluded(t *testing.T) {
 	excluded := []string{
 		"fileHashes",
 		"module-metadata.bin",
+		"module-artifact.bin",
+		"resource-at-url.bin",
 	}
 	for _, name := range excluded {
 		if !IsDeltaExcluded(name) {

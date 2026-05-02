@@ -509,6 +509,18 @@ var DeltaExclusions = []string{
 	// across machines but rewritten on every build due to DB compaction. The base
 	// bundle already has it and a single build rarely adds new dependencies.
 	"module-metadata.bin",
+
+	// module-artifact.bin caches whether artifacts have been downloaded from
+	// remote repositories. Rewritten every build due to DB compaction. If a
+	// stale copy tells Gradle an artifact is already cached when the local file
+	// doesn't exist (e.g. guava resolved under a different version directory
+	// in the base), Gradle skips the download and the build fails.
+	"module-artifact.bin",
+
+	// resource-at-url.bin caches HTTP responses for repository resource URLs.
+	// Rewritten every build due to DB compaction. A stale copy can cause Gradle
+	// to use outdated repository metadata, leading to incorrect resolution.
+	"resource-at-url.bin",
 }
 
 // wrapperZipExclusion excludes the downloaded Gradle distribution zip from
